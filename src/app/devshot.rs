@@ -25,6 +25,11 @@ impl DevShot {
         let shot_at = demo.iter().find_map(|s| s.strip_prefix("wait=")?.parse::<u32>().ok()).map_or(90, |s| 90 + s * 60);
         Some(Self { path: path.into(), demo, frame: 0, shot_at, requested: false })
     }
+
+    /// The demo includes `step`.
+    pub fn has(&self, step: &str) -> bool {
+        self.demo.iter().any(|s| s == step)
+    }
 }
 
 fn crc32(data: &[u8]) -> u32 {
@@ -93,6 +98,34 @@ fn demo_launchers() -> Vec<crate::config::Launcher> {
 }
 
 impl STerm {
+    /// Sample agents in the AI view, one per pane in tab order: two Claude Code sessions (one
+    /// working), a Codex one nearly out of context, and an Antigravity one.
+    fn agents_demo(&mut self) {
+        use crate::usage::{Live, PaneAgent};
+        use crate::usage_ui::AgentPane;
+        let now = crate::history::now();
+        let samples: [(&str, &str, &str, u64, u64, i64); 4] = [
+            ("claude", "✳ Fix the login redirect", "claude-opus-5-5", 124_000, 200_000, 300),
+            ("claude", "⠂ Add a dark mode toggle", "claude-sonnet-5-5", 36_000, 200_000, 20),
+            ("codex", "Refactor the config parser", "gpt-5.1-codex", 221_000, 272_000, 90),
+            ("agy", "agy", "gemini-4-neon-high", 48_000, 1_000_000, 600),
+        ];
+        let (mut list, mut data) = (Vec::new(), std::collections::HashMap::new());
+        let mut panes = Vec::new();
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            let mut leaves = Vec::new();
+            tab.root.leaves(&mut leaves);
+            panes.extend(leaves.into_iter().map(|id| (ti, id)));
+        }
+        for ((ti, id), (tool, title, model, used, size, ago)) in panes.into_iter().zip(samples) {
+            list.push(AgentPane { pane: id, tool, tab: ti, title: title.into() });
+            let label = if tool == "agy" { "Port the renderer to wgpu".into() } else { String::new() };
+            let live = Live { label, model: model.into(), context_tokens: used, context_size: Some(size), context_pct: None, last_ts: now - ago, requests: 12, totals: Vec::new(), here: false };
+            data.insert(id, PaneAgent { tool, folder: Some("s-term".into()), live: Some(live) });
+        }
+        self.sidebar.agents_demo(list, data);
+    }
+
     pub(super) fn devshot(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.devshot.take() else { return };
         d.frame += 1;
@@ -101,6 +134,7 @@ impl STerm {
             for step in d.demo.clone() {
                 match step.as_str() {
                     "ai" => self.sidebar.show_view(View::Ai),
+                    "agents" => self.agents_demo(),
                     "changes" => self.sidebar.show_view(View::Changes),
                     "files" => self.sidebar.show_view(View::Files),
                     "launch" => self.sidebar.show_view(View::Launch),
@@ -143,6 +177,12 @@ impl STerm {
                     s if s.starts_with("folder=") => crate::sidebar::Sidebar::add_folder(&mut self.config, PathBuf::from(&s[7..])),
                     s if s.starts_with("theme=") => self.config.theme = s[6..].to_string(),
                     s if s.starts_with("section=") => self.settings_section_by_name(&s[8..]),
+                    // The window's size in points, e.g. `size=1100x1300` to see all of a long panel.
+                    s if s.starts_with("size=") => {
+                        if let Some((w, h)) = s[5..].split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))) {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+                        }
+                    }
                     _ => {}
                 }
             }

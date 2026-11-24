@@ -17,6 +17,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use crate::pricing::{self, Cost};
+
 /// How far back transcripts are read (Claude Code itself keeps ~30 days).
 const KEEP_SECS: i64 = 400 * 86400;
 const LIVE_SECS: i64 = 30 * 60;
@@ -33,11 +35,19 @@ pub struct Rec {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// What the request would cost on the model's API (None if its price isn't known).
+    pub cost: Option<Cost>,
 }
 
 impl Rec {
     fn context(&self) -> u64 {
         self.input + self.cache_read + self.cache_write
+    }
+
+    /// The record with its API cost; see `pricing::request`.
+    fn priced(mut self, write_1h: u64, mult: f64) -> Self {
+        self.cost = pricing::request(&self, write_1h, mult);
+        self
     }
 }
 
@@ -49,6 +59,8 @@ pub struct ModelTotal {
     pub cache_read: u64,
     pub cache_write: u64,
     pub requests: u32,
+    /// The API cost of these requests, None if the model's price isn't known.
+    pub cost: Option<Cost>,
 }
 
 impl ModelTotal {
@@ -77,6 +89,24 @@ pub struct Live {
     pub totals: Vec<ModelTotal>,
     /// The live session belongs to the focused pane's folder.
     pub here: bool,
+}
+
+/// An AI CLI in one of S-term's panes, as the UI reports it: the pane, the tool (`claude`, `codex`
+/// or `agy`) and the process group it runs as.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AgentProc {
+    pub pane: u64,
+    pub tool: &'static str,
+    pub pgid: u32,
+}
+
+/// What the agent in one pane is doing, from its tool's files.
+pub struct PaneAgent {
+    pub tool: &'static str,
+    /// The name of the folder it runs in (`~` for home).
+    pub folder: Option<String>,
+    /// Its conversation's last reply: None before the first one, or while no conversation is open.
+    pub live: Option<Live>,
 }
 
 #[derive(Default)]
@@ -147,7 +177,7 @@ impl AgyQuota {
 }
 
 /// Lowercase, with every run of other characters as one dash: "Claude Opus 5.5" -> "claude-opus-5-5".
-fn model_key(s: &str) -> String {
+pub(crate) fn model_key(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         if c.is_ascii_alphanumeric() {
@@ -189,6 +219,8 @@ pub struct Snapshot {
     pub statusline_seen: bool,
     /// Antigravity's plan quota, once `agy -p /usage` has answered.
     pub agy_quota: Option<Arc<AgyQuota>>,
+    /// The agents running in S-term's panes (see `Usage::set_agents`), by pane.
+    pub agents: HashMap<u64, PaneAgent>,
 }
 
 // ------------------------------------------------------------------------------------------ helpers
@@ -344,6 +376,9 @@ fn aggregate<'a>(recs: impl Iterator<Item = &'a Rec>) -> Vec<ModelTotal> {
         t.cache_read += r.cache_read;
         t.cache_write += r.cache_write;
         t.requests += 1;
+        if let Some(c) = r.cost {
+            *t.cost.get_or_insert_with(Cost::default) += c;
+        }
     }
     let mut v: Vec<_> = map.into_values().collect();
     v.sort_by(|a, b| b.total().cmp(&a.total()));
@@ -470,7 +505,12 @@ impl ClaudeScanner {
             output: g("output_tokens"),
             cache_read: g("cache_read_input_tokens"),
             cache_write: g("cache_creation_input_tokens"),
+            cost: None,
         };
+        // Claude Code writes its prompt cache for an hour, which costs more than 5 minutes; fast mode and
+        // US-only inference cost more too.
+        let mult = if u["speed"] == "fast" { pricing::FAST } else { 1.0 } * if u["inference_geo"] == "us" { pricing::US_ONLY } else { 1.0 };
+        let rec = rec.priced(u["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap_or(0), mult);
         // A message is logged once per content block with the same usage: keep one (the latest).
         let key = format!("{}:{}", msg["id"].as_str().unwrap_or(""), v["requestId"].as_str().unwrap_or(""));
         match f.ids.get(&key) {
@@ -487,7 +527,7 @@ impl ClaudeScanner {
         cwd.to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
     }
 
-    fn stats(&self, now: i64, focus: Option<&Path>, status: &HashMap<String, Value>) -> ToolStats {
+    fn stats(&self, now: i64, focus: Option<&Path>, status: &HashMap<String, (i64, Value)>) -> ToolStats {
         let mut st = tool_stats(self.files.values().map(|f| f.recs.as_slice()), now);
         let want = focus.map(Self::project_dir);
         // Live session: newest active one in the focused folder, else the newest active anywhere.
@@ -505,34 +545,51 @@ impl ClaudeScanner {
                 best = Some((p, f, last, here));
             }
         }
-        if let Some((p, f, last, here)) = best {
-            let latest = f.recs.iter().max_by_key(|r| r.ts).unwrap();
+        if let Some((p, f, _, here)) = best {
             let session_id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let sl = status.get(&session_id);
-            let cw = sl.map(|v| &v["context_window"]);
+            let sl = status.get(&session_id).filter(|(t, _)| *t >= now - STATUS_FRESH_SECS);
             let label = sl
-                .and_then(|v| v["workspace"]["current_dir"].as_str().or(v["cwd"].as_str()))
+                .and_then(|(_, v)| v["workspace"]["current_dir"].as_str().or(v["cwd"].as_str()))
                 .and_then(|d| Path::new(d).file_name().map(|n| n.to_string_lossy().into_owned()))
                 .or_else(|| focus.filter(|_| here).and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()))
                 .unwrap_or_else(|| p.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
-            st.live = Some(Live {
-                label,
-                model: latest.model.clone(),
-                context_tokens: latest.context(),
-                context_size: cw.and_then(|c| c["context_window_size"].as_u64()),
-                context_pct: cw.and_then(|c| c["used_percentage"].as_f64()).map(|x| x as f32),
-                last_ts: last,
-                requests: f.recs.len() as u32,
-                totals: aggregate(f.recs.iter()),
-                here,
-            });
+            st.live = Self::live(f, sl, label, here);
         }
         st
     }
+
+    /// A session's last reply: its model and context, with the window size from its status line.
+    /// The status line's percentage is used only if it was written after that reply and measured
+    /// something: a resumed session's first one reports 0% before its first request.
+    fn live(f: &ClaudeFile, sl: Option<&(i64, Value)>, label: String, here: bool) -> Option<Live> {
+        let latest = f.recs.iter().max_by_key(|r| r.ts)?;
+        let cw = sl.map(|(_, v)| &v["context_window"]);
+        let measured = cw.is_some_and(|c| ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"].iter().any(|k| c["current_usage"][k].as_u64().unwrap_or(0) > 0));
+        let current = measured && sl.is_some_and(|(t, _)| *t >= latest.ts - 60);
+        Some(Live {
+            label,
+            model: latest.model.clone(),
+            context_tokens: latest.context(),
+            context_size: cw.and_then(|c| c["context_window_size"].as_u64()),
+            context_pct: cw.filter(|_| current).and_then(|c| c["used_percentage"].as_f64()).map(|x| x as f32),
+            last_ts: latest.ts,
+            requests: f.recs.len() as u32,
+            totals: aggregate(f.recs.iter()),
+            here,
+        })
+    }
+
+    /// Session `id` (a transcript's file name), with its status line of any age: an idle session's
+    /// last one still has its window size.
+    fn session(&self, id: &str, status: &HashMap<String, (i64, Value)>) -> Option<Live> {
+        let (_, f) = self.files.iter().find(|(p, _)| p.file_stem().is_some_and(|s| s == id) && !p.parent().and_then(|d| d.file_name()).is_some_and(|n| n == "subagents"))?;
+        Self::live(f, status.get(id), String::new(), false)
+    }
 }
 
-/// Latest status-line JSON per session id, the plan limits from all of them, and whether any exist.
-fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Limits>, bool) {
+/// Every saved status-line JSON by session id, with its file time; the plan limits from all of
+/// them; and whether any exist.
+fn read_status_files(now: i64) -> (HashMap<String, (i64, Value)>, Option<Limits>, bool) {
     let mut map = HashMap::new();
     let mut reports: Vec<(i64, Value)> = Vec::new();
     let mut any = false;
@@ -552,10 +609,8 @@ fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Limits>, bool)
             if !v["rate_limits"].is_null() {
                 reports.push((t, v["rate_limits"].clone()));
             }
-            if t >= now - STATUS_FRESH_SECS {
-                if let Some(id) = v["session_id"].as_str() {
-                    map.insert(id.to_string(), v);
-                }
+            if let Some(id) = v["session_id"].as_str() {
+                map.insert(id.to_string(), (t, v));
             }
         }
     }
@@ -712,7 +767,7 @@ impl AgyScanner {
             let name = pb::int(u, 1).and_then(|id| names.get(&id).cloned()).or_else(|| fallback.clone()).unwrap_or_else(|| "gemini".into());
             raw.push((ts, name, g(2), g(3), g(5), g(4)));
         }
-        let recs = raw.into_iter().map(|(ts, name, input, output, cache_read, cache_write)| Rec { ts, model: self.intern(&name), input, output, cache_read, cache_write }).collect();
+        let recs = raw.into_iter().map(|(ts, name, input, output, cache_read, cache_write)| Rec { ts, model: self.intern(&name), input, output, cache_read, cache_write, cost: None }.priced(0, 1.0)).collect();
         Some(AgyConv { stamp: (None, None), recs, context })
     }
 
@@ -775,24 +830,35 @@ impl AgyScanner {
                 best = Some((p, c, last, here));
             }
         }
-        if let Some((p, c, last, here)) = best {
+        if let Some((p, c, _, here)) = best {
             let id = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let latest = c.recs.iter().max_by_key(|r| r.ts).unwrap();
-            let label = self.meta.get(&id).map(|(t, _)| t.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "conversation".into());
-            st.live = Some(Live {
-                label,
-                model: latest.model.clone(),
-                // Antigravity's own count against its window (what it compacts by), else the last request's input.
-                context_tokens: c.context.map_or(latest.context(), |(used, _)| used),
-                context_size: c.context.map(|(_, max)| max),
-                context_pct: None,
-                last_ts: last,
-                requests: c.recs.len() as u32,
-                totals: aggregate(c.recs.iter()),
-                here,
-            });
+            st.live = self.live(&id, c, here);
         }
         st
+    }
+
+    /// Conversation `id`'s last step; labeled with its title.
+    fn live(&self, id: &str, c: &AgyConv, here: bool) -> Option<Live> {
+        let latest = c.recs.iter().max_by_key(|r| r.ts)?;
+        let label = self.meta.get(id).map(|(t, _)| t.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| "conversation".into());
+        Some(Live {
+            label,
+            model: latest.model.clone(),
+            // Antigravity's own count against its window (what it compacts by), else the last request's input.
+            context_tokens: c.context.map_or(latest.context(), |(used, _)| used),
+            context_size: c.context.map(|(_, max)| max),
+            context_pct: None,
+            last_ts: latest.ts,
+            requests: c.recs.len() as u32,
+            totals: aggregate(c.recs.iter()),
+            here,
+        })
+    }
+
+    /// Conversation `id` (its database's file name).
+    fn session(&self, id: &str) -> Option<Live> {
+        let c = self.convs.get(&Self::root().join("conversations").join(format!("{id}.db")))?;
+        self.live(id, c, false)
     }
 }
 
@@ -1004,7 +1070,9 @@ impl CodexScanner {
                     output: g("output_tokens"),
                     cache_read: cached,
                     cache_write: 0,
-                });
+                    cost: None,
+                }
+                .priced(0, 1.0));
             }
             _ => {}
         }
@@ -1024,33 +1092,63 @@ impl CodexScanner {
                 best = Some((f, last, here));
             }
         }
-        if let Some((f, last, here)) = best {
-            let latest = f.recs.iter().max_by_key(|r| r.ts).unwrap();
-            let ctx = latest.context();
-            let label = f.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into());
-            st.live = Some(Live {
-                label,
-                model: latest.model.clone(),
-                context_tokens: ctx,
-                context_size: f.context_window,
-                context_pct: f.context_window.filter(|w| *w > 0).map(|w| ctx as f32 / w as f32 * 100.0),
-                last_ts: last,
-                requests: f.recs.len() as u32,
-                totals: aggregate(f.recs.iter()),
-                here,
-            });
+        if let Some((f, _, here)) = best {
+            st.live = Self::live(f, here);
         }
         st
+    }
+
+    fn live(f: &CodexFile, here: bool) -> Option<Live> {
+        let latest = f.recs.iter().max_by_key(|r| r.ts)?;
+        let ctx = latest.context();
+        let label = f.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into());
+        Some(Live {
+            label,
+            model: latest.model.clone(),
+            context_tokens: ctx,
+            context_size: f.context_window,
+            context_pct: f.context_window.filter(|w| *w > 0).map(|w| ctx as f32 / w as f32 * 100.0),
+            last_ts: latest.ts,
+            requests: f.recs.len() as u32,
+            totals: aggregate(f.recs.iter()),
+            here,
+        })
+    }
+
+    /// Session `id`: the rollout file whose name ends with it.
+    fn session(&self, id: &str) -> Option<Live> {
+        let (_, f) = self.files.iter().find(|(p, _)| p.file_stem().is_some_and(|s| s.to_string_lossy().ends_with(id)))?;
+        Self::live(f, false)
     }
 }
 
 // ------------------------------------------------------------------------------------------- worker
+
+/// The conversation of each agent in S-term's panes: Claude Code's from `sessions/<pid>.json`,
+/// Codex's from the rollout file it has open, Antigravity's from the presence lock it holds.
+fn pane_agents(procs: &[AgentProc], claude: &ClaudeScanner, codex: &CodexScanner, agy: &AgyScanner, status: &HashMap<String, (i64, Value)>) -> HashMap<u64, PaneAgent> {
+    let home = home();
+    procs
+        .iter()
+        .map(|a| {
+            let live = crate::history::conversation(a.tool, a.pgid).and_then(|id| match a.tool {
+                "claude" => claude.session(&id, status),
+                "codex" => codex.session(&id),
+                "agy" => agy.session(&id),
+                _ => None,
+            });
+            let folder = std::fs::read_link(format!("/proc/{}/cwd", a.pgid)).ok().and_then(|d| if d == home { Some("~".into()) } else { d.file_name().map(|n| n.to_string_lossy().into_owned()) });
+            (a.pane, PaneAgent { tool: a.tool, folder, live })
+        })
+        .collect()
+}
 
 pub struct Usage {
     shared: Arc<Mutex<Option<Arc<Snapshot>>>>,
     focus: Arc<Mutex<Option<PathBuf>>>,
     /// Antigravity is turned on in Settings, so its quota is polled.
     agy_quota: Arc<AtomicBool>,
+    agents: Arc<Mutex<Vec<AgentProc>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1062,7 +1160,8 @@ impl Usage {
         let shared: Arc<Mutex<Option<Arc<Snapshot>>>> = Arc::default();
         let focus: Arc<Mutex<Option<PathBuf>>> = Arc::default();
         let agy_quota: Arc<AtomicBool> = Arc::default();
-        let (s2, f2, q2) = (shared.clone(), focus.clone(), agy_quota.clone());
+        let agents: Arc<Mutex<Vec<AgentProc>>> = Arc::default();
+        let (s2, f2, q2, a2) = (shared.clone(), focus.clone(), agy_quota.clone(), agents.clone());
         std::thread::Builder::new()
             .name("s-term-usage".into())
             .spawn(move || {
@@ -1074,6 +1173,7 @@ impl Usage {
                 loop {
                     let now = now_secs();
                     let focus = lock(&f2).clone();
+                    let in_panes = lock(&a2).clone();
                     let (status, limits, seen) = read_status_files(now);
                     let claude_installed = claude.scan(now);
                     let agy_installed = agy.scan(now);
@@ -1096,6 +1196,7 @@ impl Usage {
                             .chain(codex.files.values().flat_map(|f| f.recs.iter())),
                     );
                     ledger.merge(&fresh);
+                    let agents = pane_agents(&in_panes, &claude, &codex, &agy, &status);
                     let snap = Snapshot {
                         now,
                         today: day_of(now),
@@ -1106,18 +1207,24 @@ impl Usage {
                         limits,
                         statusline_seen: seen,
                         agy_quota: quota.quota.clone(),
+                        agents,
                     };
                     *lock(&s2) = Some(Arc::new(snap));
                     ctx.request_repaint();
-                    // Sleep, but wake early when the focused folder changes.
+                    // Sleep, but wake early when the focused folder changes or an agent starts or quits.
                     let until = std::time::Instant::now() + REFRESH;
-                    while std::time::Instant::now() < until && *lock(&f2) == focus {
+                    while std::time::Instant::now() < until && *lock(&f2) == focus && *lock(&a2) == in_panes {
                         std::thread::sleep(Duration::from_millis(100));
                     }
                 }
             })
             .expect("spawn usage thread");
-        Self { shared, focus, agy_quota }
+        Self { shared, focus, agy_quota, agents }
+    }
+
+    /// The AI CLIs running in S-term's panes, so the snapshot has each one's conversation.
+    pub fn set_agents(&self, agents: Vec<AgentProc>) {
+        *lock(&self.agents) = agents;
     }
 
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -1190,7 +1297,8 @@ pub fn report_main() {
         }
         for (w, label) in [(Window::FiveHours, "5h"), (Window::Today, "today"), (Window::Week, "7d")] {
             for m in &st.windows[&w] {
-                println!("  {label:>5}  {:<28} in {:>9}  cache-w {:>9}  cache-r {:>11}  out {:>9}  req {:>5}", m.model, m.input, m.cache_write, m.cache_read, m.output, m.requests);
+                let cost = m.cost.map_or("-".into(), |c| format!("${:.2}", c.total()));
+                println!("  {label:>5}  {:<28} in {:>9}  cache-w {:>9}  cache-r {:>11}  out {:>9}  req {:>5}  api {cost:>9}", m.model, m.input, m.cache_write, m.cache_read, m.output, m.requests);
             }
         }
         println!();

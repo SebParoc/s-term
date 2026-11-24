@@ -615,6 +615,8 @@ pub enum UiAction {
     Launcher(u64, crate::launchpad::Op),
     /// Reopen, delete… a History entry (by id).
     History(u64, crate::history::Op),
+    /// Go to a pane (and its tab).
+    FocusPane(crate::pane::PaneId),
 }
 
 pub struct Sidebar {
@@ -659,6 +661,10 @@ pub struct Sidebar {
     dragging: Option<PathBuf>,
     pub usage: crate::usage::Usage,
     usage_ui: crate::usage_ui::UsageUi,
+    /// The AI CLIs in S-term's panes, in tab order, for the AI view (kept up to date by the app).
+    pub agents: Vec<crate::usage_ui::AgentPane>,
+    /// The focused pane, for the AI view's agent list.
+    pub focused_pane: Option<crate::pane::PaneId>,
     launchpad: crate::launchpad::LaunchpadUi,
     history_ui: crate::history::HistoryUi,
 }
@@ -820,6 +826,8 @@ impl Sidebar {
             dragging: None,
             usage,
             usage_ui: Default::default(),
+            agents: Vec::new(),
+            focused_pane: None,
             launchpad: Default::default(),
             history_ui: Default::default(),
         }
@@ -858,6 +866,12 @@ impl Sidebar {
         self.show_view(Tab::Launch);
         let dir = dir.or_else(|| self.cwd.clone());
         self.launchpad.new_draft(dir.as_deref());
+    }
+
+    /// Screenshot mode: sample agents in the AI view, in place of the real ones.
+    pub fn agents_demo(&mut self, agents: Vec<crate::usage_ui::AgentPane>, data: HashMap<u64, crate::usage::PaneAgent>) {
+        self.agents = agents;
+        self.usage_ui.demo = Some(data);
     }
 
     /// Latest git/files snapshot of the followed folder (also used by the status bar).
@@ -1125,7 +1139,9 @@ impl Sidebar {
                 if self.tab == Tab::Ai {
                     let usage = self.usage.snapshot();
                     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                        crate::usage_ui::tab(ui, theme, usage.as_deref(), &mut self.usage_ui, cfg);
+                        if let Some(pane) = crate::usage_ui::tab(ui, theme, usage.as_deref(), &mut self.usage_ui, cfg, &self.agents, self.focused_pane) {
+                            actions.push(UiAction::FocusPane(pane));
+                        }
                     });
                     return;
                 }

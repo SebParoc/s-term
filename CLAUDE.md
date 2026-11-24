@@ -42,8 +42,9 @@ S_TERM_SCREENSHOT=target/shots/x.png S_TERM_DEMO=split,ai ./target/release/s-ter
 
 Steps, comma-separated: `ai` `changes` `files` `settings` `section=<name>` `palette` `commands` `ask` (a sample
 conversation waiting for approval) `asktyped=<text>` `setup` `setup=<n>` `split` `splitdown` `tab` `zoom`
-`theme=<id>` `folder=<dir>` `view=<file>` `wait=<s>` (shoot about s seconds later, e.g. for usage data) `launch` (the Launchpad view) `launchdemo` (load sample launchers)
-`launchnew` (the editor, filled in from the focused pane's folder) `launchrun` (run the sample ping; after
+`theme=<id>` `folder=<dir>` `view=<file>` `wait=<s>` (shoot about s seconds later, e.g. for usage data) `size=<w>x<h>`
+(the window size, e.g. `size=1100x1300` to see all of a long side panel) `launch` (the Launchpad view) `launchdemo` (load sample launchers)
+`agents` (sample agents in the AI view's Now list, one per open pane; add `split`/`tab` first) `launchnew` (the editor, filled in from the focused pane's folder) `launchrun` (run the sample ping; after
 `launchdemo`) `history` (the History view) `historydemo` (sample History entries) `restoreoffer` (the startup
 "reopen your last session?" popup). Open the PNG with the Read tool to check the result. `S_TERM_FONT="Family"`
 forces a font.

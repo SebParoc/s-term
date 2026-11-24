@@ -253,6 +253,24 @@ impl STerm {
         self.focused().and_then(|p| p.cwd())
     }
 
+    /// Finds the AI CLIs running in panes, in tab order: the AI view lists them, and the usage
+    /// worker looks up each one's conversation from its process group.
+    fn track_agents(&mut self) {
+        let (mut list, mut procs) = (Vec::new(), Vec::new());
+        for (ti, tab) in self.tabs.iter().enumerate() {
+            let mut leaves = Vec::new();
+            tab.root.leaves(&mut leaves);
+            for id in leaves {
+                let Some(p) = self.panes.get(&id) else { continue };
+                let (Some(tool), Some(pgid)) = (p.ai_tool(), p.foreground_pgid()) else { continue };
+                list.push(crate::usage_ui::AgentPane { pane: id, tool, tab: ti, title: p.title.clone() });
+                procs.push(crate::usage::AgentProc { pane: id, tool, pgid });
+            }
+        }
+        self.sidebar.usage.set_agents(procs);
+        self.sidebar.agents = list;
+    }
+
     fn new_tab(&mut self) {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let cwd = if self.config.new_tab_home && !self.tabs.is_empty() { home } else { self.focused_cwd() };
@@ -695,6 +713,9 @@ impl STerm {
                 UiAction::Drop(path, pos) => self.drop_paths(&[path], pos),
                 UiAction::Launcher(id, op) => self.launch_op(id, op),
                 UiAction::History(id, op) => self.history_op(id, op),
+                UiAction::FocusPane(id) => {
+                    self.focus_pane(id);
+                }
             }
         }
     }
@@ -796,6 +817,10 @@ impl eframe::App for STerm {
             let cwd = self.focused_cwd();
             self.sidebar.follow(cwd);
             self.sidebar.usage.set_agy_quota(self.config.show_antigravity);
+            // Screenshots with `agents` show sample ones instead.
+            if !self.devshot.as_ref().is_some_and(|d| d.has("agents")) {
+                self.track_agents();
+            }
         }
 
         self.frame_resize(ctx);
@@ -810,6 +835,7 @@ impl eframe::App for STerm {
             self.status_bar(ctx);
         }
         self.rail(ctx);
+        self.sidebar.focused_pane = self.tab().map(|t| t.focus);
         let actions = self.sidebar.show(ctx, &self.theme, &mut self.config, &self.launch_status, &self.hist.store);
         self.run_sidebar_actions(ctx, actions);
         egui::CentralPanel::default()

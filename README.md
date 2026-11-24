@@ -234,11 +234,15 @@ command lines. Turn it off in Settings → Terminal → *Remember closed tabs*.
 Usage tracking is optional. During setup, S-term asks which AI coding tools you use (Claude Code, Codex, Antigravity)
 and turns on the ones it finds. You can change them in Settings → AI tools. The AI view has four sections:
 
-- **Now:** each tool's live session, with a context ring that turns yellow at 50% and red at 75%
+- **Now:** each tool folds open to list its agents running in S-term, in any tab or pane: what the pane is about,
+  a context ring with the percentage used (yellow at 50%, red at 75%), the tokens against the window, the model and
+  the tab. A green dot pulses while one works. Click an agent to go to its pane, or a tool to fold its list.
 - **Plan limits:** Claude Code's 5-hour and weekly limits, and Antigravity's for each of its model groups, with reset
   countdowns
 - **Usage:** tokens per model across the tools you turned on, for the last 5 hours, today or the last 7 days, plus a
-  24-hour output chart. Hover a model for its breakdown.
+  24-hour output chart. Next to the tokens is what they would cost on the providers' pay-as-you-go APIs, in USD, at
+  Anthropic's, OpenAI's and Google's list prices (Claude Code's 1-hour cache writes and fast mode included). It's an
+  equivalent: your plan bills differently. Hover a model for its breakdown by kind of token.
 - **Activity:** a calendar heatmap of daily tokens (output tokens or all tokens, see Settings → AI tools). Pick a
   model to see only that model, and hover a day for its details.
 
@@ -373,7 +377,7 @@ the provider you picked, and Antigravity's own quota check when that tool is tur
 |---|---|
 | `s-term` | Opens a window. Its first tab starts in the current folder. |
 | `s-term statusline` | The Claude Code status-line hook (see [Claude Code plan limits](#claude-code-plan-limits)) |
-| `s-term usage` | Prints the token totals the AI view shows, per tool and model |
+| `s-term usage` | Prints the token totals and API costs the AI view shows, per tool and model |
 | `S_TERM_FONT="Family Name" s-term` | Forces a terminal font |
 
 ## Development
@@ -432,6 +436,7 @@ glibc as new as yours.
 | `src/launchpad.rs` | Launchpad view: the launcher list and editor, and the command lines they type |
 | `src/history.rs` | History: entries and their files, reading what a pane runs (agent conversation ids), the History view |
 | `src/usage.rs` | Claude Code, Codex and Antigravity usage readers |
+| `src/pricing.rs` | API list prices per model, for the AI view's USD cost |
 | `src/usage_ui.rs` | AI view, its icons and the status-bar meter |
 | `src/config.rs` | Settings file |
 | `src/theme.rs` | Color themes |

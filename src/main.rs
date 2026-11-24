@@ -26,6 +26,7 @@ mod input;
 mod launchpad;
 mod layout;
 mod pane;
+mod pricing;
 mod render;
 mod sidebar;
 mod theme;

@@ -355,6 +355,28 @@ fn codex_session(pid: u32) -> Option<String> {
     std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten().find_map(|e| rollout_id(&std::fs::read_link(e.path()).ok()?))
 }
 
+/// The conversation of the Antigravity process `pid`: it holds a lock on `presence/<id>.lock`
+/// while a conversation is open (none on its start screen).
+fn agy_session(pid: u32) -> Option<String> {
+    std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten().find_map(|e| {
+        let p = std::fs::read_link(e.path()).ok()?;
+        let in_presence = p.parent().is_some_and(|d| d.ends_with("antigravity-cli/presence"));
+        let id = p.file_name()?.to_str()?.strip_suffix(".lock")?;
+        (in_presence && valid_id(id)).then(|| id.to_string())
+    })
+}
+
+/// The conversation an AI CLI (`claude`, `codex` or `agy`, as `Pane::ai_tool` names it) has open in
+/// process group `pgid`.
+pub fn conversation(tool: &str, pgid: u32) -> Option<String> {
+    match tool {
+        "claude" => in_group(pgid, claude_session),
+        "codex" => in_group(pgid, codex_session),
+        "agy" => in_group(pgid, agy_session),
+        _ => None,
+    }
+}
+
 fn rollout_id(p: &Path) -> Option<String> {
     let name = p.file_name()?.to_str()?;
     let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;

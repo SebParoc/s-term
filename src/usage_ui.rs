@@ -1,12 +1,13 @@
 //! Drawing for the AI usage tab and the status-bar meter.
 
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
 
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke};
 
 use crate::theme::{c32, lerp_color, Theme};
 use crate::config::{Config, HeatMetric};
-use crate::usage::{civil, weekday, DayStat, Limit, Live, ModelTotal, Snapshot, ToolStats, Window};
+use crate::usage::{civil, weekday, DayStat, Limit, Live, ModelTotal, PaneAgent, Snapshot, ToolStats, Window};
 
 const CLICK: Sense = Sense { click: true, drag: false, focusable: false };
 
@@ -20,12 +21,26 @@ pub struct UsageUi {
     window: Window,
     /// Heatmap filter: None = all models.
     heat_model: Option<String>,
+    /// Screenshot mode's sample agents, shown instead of what the snapshot found.
+    pub demo: Option<HashMap<u64, PaneAgent>>,
 }
 
 impl Default for UsageUi {
     fn default() -> Self {
-        Self { window: Window::Today, heat_model: None }
+        Self { window: Window::Today, heat_model: None, demo: None }
     }
+}
+
+/// An AI CLI running in one of S-term's panes, as the UI sees it (refreshed every 500 ms). Its
+/// conversation is in `Snapshot::agents`, by pane.
+pub struct AgentPane {
+    pub pane: u64,
+    /// `claude`, `codex` or `agy`.
+    pub tool: &'static str,
+    /// Its tab, from 0.
+    pub tab: usize,
+    /// The pane's title: the agents name it after what the conversation is about.
+    pub title: String,
 }
 
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -46,17 +61,26 @@ fn metric_of(st: &DayStat, m: HeatMetric) -> u64 {
 /// GitHub-style calendar of daily usage. In "All" mode each day takes the color of its busiest model.
 fn heatmap(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, state: &mut UsageUi, metric: &mut HeatMetric) {
     let horizon = s.today - 371;
-    let mut totals: Vec<(String, u64)> = {
-        let mut m: std::collections::HashMap<&str, u64> = Default::default();
-        for (_, models) in s.daily.range(horizon..=s.today) {
-            for (k, v) in models {
-                *m.entry(k.as_str()).or_default() += metric_of(v, *metric);
+    // Models go by display name, like the Usage list: one Antigravity model has an id per effort level.
+    let mut names: HashMap<&str, String> = HashMap::new();
+    for (_, models) in s.daily.range(horizon..=s.today) {
+        for k in models.keys() {
+            names.entry(k.as_str()).or_insert_with(|| model_name(k));
+        }
+    }
+    // (display name, its busiest id for the color, total)
+    let mut totals: Vec<(String, &str, u64)> = Vec::new();
+    for (_, models) in s.daily.range(horizon..=s.today) {
+        for (k, v) in models {
+            let name = &names[k.as_str()];
+            match totals.iter_mut().find(|t| &t.0 == name) {
+                Some(t) => t.2 += metric_of(v, *metric),
+                None => totals.push((name.clone(), k.as_str(), metric_of(v, *metric))),
             }
         }
-        m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-    };
-    totals.sort_by(|a, b| b.1.cmp(&a.1));
-    if state.heat_model.as_ref().is_some_and(|m| !totals.iter().any(|(k, _)| k == m)) {
+    }
+    totals.sort_by_key(|t| std::cmp::Reverse(t.2));
+    if state.heat_model.as_ref().is_some_and(|m| !totals.iter().any(|t| &t.0 == m)) {
         state.heat_model = None;
     }
 
@@ -71,7 +95,10 @@ fn heatmap(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, state: &mut UsageUi, 
     let value = |day: i64| -> (u64, Option<&str>) {
         let Some(models) = s.daily.get(&day) else { return (0, None) };
         match &state.heat_model {
-            Some(m) => (models.get(m).map_or(0, |v| metric_of(v, *metric)), Some(m.as_str())),
+            Some(m) => {
+                let mine = models.iter().filter(|(k, _)| names.get(k.as_str()) == Some(m));
+                (mine.clone().map(|(_, v)| metric_of(v, *metric)).sum(), mine.max_by_key(|(_, v)| metric_of(v, *metric)).map(|(k, _)| k.as_str()))
+            }
             None => {
                 let sum = models.values().map(|v| metric_of(v, *metric)).sum();
                 let top = models.iter().max_by_key(|(_, v)| metric_of(v, *metric)).map(|(k, _)| k.as_str());
@@ -143,13 +170,21 @@ fn heatmap(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, state: &mut UsageUi, 
             ui.label(RichText::new(day_label(day)).strong());
             match s.daily.get(&day) {
                 Some(models) if !models.is_empty() => {
-                    let mut v: Vec<_> = models.iter().collect();
-                    v.sort_by(|a, b| metric_of(b.1, *metric).cmp(&metric_of(a.1, *metric)));
-                    for (m, st) in v {
+                    // (name, id for the color, day's tokens)
+                    let mut v: Vec<(String, &str, DayStat)> = Vec::new();
+                    for (k, st) in models {
+                        let name = model_name(k);
+                        match v.iter_mut().find(|e| e.0 == name) {
+                            Some(e) => (e.2.output, e.2.total) = (e.2.output + st.output, e.2.total + st.total),
+                            None => v.push((name, k.as_str(), *st)),
+                        }
+                    }
+                    v.sort_by_key(|e| std::cmp::Reverse(metric_of(&e.2, *metric)));
+                    for (name, id, st) in v {
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
-                            ui.painter().circle_filled(r.center(), 3.5, model_color(m, theme));
-                            ui.label(model_name(m));
+                            ui.painter().circle_filled(r.center(), 3.5, model_color(id, theme));
+                            ui.label(name);
                             ui.label(RichText::new(format!("{} out · {} total", tokens(st.output), tokens(st.total))).color(theme.muted));
                         });
                     }
@@ -184,25 +219,25 @@ fn heatmap(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, state: &mut UsageUi, 
         if text_toggle(ui, theme, "All", None, state.heat_model.is_none(), Id::new("s-term-heat-all")).clicked() {
             state.heat_model = None;
         }
-        for (m, _) in &totals {
-            let on = state.heat_model.as_deref() == Some(m.as_str());
-            if text_toggle(ui, theme, &model_name(m), Some(model_color(m, theme)), on, Id::new(("s-term-heat-m", m))).clicked() {
-                state.heat_model = if on { None } else { Some(m.clone()) };
+        for (name, id, _) in &totals {
+            let on = state.heat_model.as_deref() == Some(name.as_str());
+            if text_toggle(ui, theme, name, Some(model_color(id, theme)), on, Id::new(("s-term-heat-m", name))).clicked() {
+                state.heat_model = if on { None } else { Some(name.clone()) };
             }
         }
     });
     // One line of stats instead of a block.
     let total: u64 = days.iter().map(|d| d.1).sum();
-    let mut parts = vec![format!("{} in {weeks} weeks", tokens(total)), format!("{active} active days")];
+    let mut parts = vec![tokens(total), format!("{active} active day{}", if active == 1 { "" } else { "s" })];
     if let Some((d, _)) = busiest {
         let (_, m, dd) = civil(*d);
         parts.push(format!("busiest {} {dd}", MONTHS[(m - 1) as usize]));
     }
-    if streak > 0 {
+    if streak > 1 {
         parts.push(format!("{streak}-day streak"));
     }
     ui.add_space(4.0);
-    ui.label(RichText::new(parts.join("  ·  ")).size(10.5).color(theme.muted));
+    ui.label(RichText::new(parts.join(" · ")).size(10.5).color(theme.muted));
 }
 
 // ------------------------------------------------------------------------------------------ format
@@ -218,6 +253,19 @@ pub fn tokens(n: u64) -> String {
 
 fn trim(s: String) -> String {
     s.replace(".0k", "k").replace(".0M", "M")
+}
+
+/// `$0.42`, `$140.58`, `$1,234`, `$1.23M`; `<$0.01` for less than a cent.
+pub fn usd(x: f64) -> String {
+    match x {
+        x if x > 0.0 && x < 0.005 => "<$0.01".into(),
+        x if x < 1000.0 => format!("${x:.2}"),
+        x if x < 1e6 => {
+            let n = x.round() as u64;
+            format!("${},{:03}", n / 1000, n % 1000)
+        }
+        x => format!("${:.2}M", x / 1e6),
+    }
 }
 
 fn duration(secs: i64) -> String {
@@ -238,7 +286,8 @@ fn ago(now: i64, t: i64) -> String {
     }
 }
 
-/// `claude-opus-5-5` -> `Opus 5.5`, `gemini-4-neon-high` -> `Gemini 4 Neon · high`.
+/// `claude-opus-5-5` -> `Opus 5.5`, `gemini-4-neon-high` -> `Gemini 4 Neon` (Antigravity puts the
+/// effort level in the id; it isn't a different model).
 pub fn model_name(id: &str) -> String {
     let id = id.split('[').next().unwrap_or(id);
     if let Some(rest) = id.strip_prefix("claude-") {
@@ -247,19 +296,10 @@ pub fn model_name(id: &str) -> String {
         let version: Vec<&str> = parts.collect();
         return format!("{}{} {}", family[..1.min(family.len())].to_uppercase(), family.get(1..).unwrap_or(""), version.join(".")).trim().to_string();
     }
-    if let Some(rest) = id.strip_prefix("gemini-") {
-        let parts: Vec<&str> = rest.split('-').collect();
+    if id == "gemini" || id.starts_with("gemini-") {
         let tiers = ["low", "medium", "high", "xhigh", "max"];
-        let (body, tier) = match parts.last() {
-            Some(t) if tiers.contains(t) => (&parts[..parts.len() - 1], Some(*t)),
-            _ => (&parts[..], None),
-        };
-        let body: Vec<String> = body.iter().map(|w| format!("{}{}", w[..1.min(w.len())].to_uppercase(), w.get(1..).unwrap_or(""))).collect();
-        let mut s = format!("Gemini {}", body.join(" "));
-        if let Some(t) = tier {
-            s.push_str(&format!(" · {t}"));
-        }
-        return s;
+        let words: Vec<String> = id.split('-').skip(1).filter(|w| !tiers.contains(w)).map(|w| format!("{}{}", w[..1.min(w.len())].to_uppercase(), w.get(1..).unwrap_or(""))).collect();
+        return format!("Gemini {}", words.join(" ")).trim_end().to_string();
     }
     if let Some(rest) = id.strip_prefix("gpt-") {
         // gpt-5.1-codex-mini -> GPT-5.1 Codex Mini
@@ -510,107 +550,333 @@ fn pct_of(live: &Live) -> Option<f32> {
     live.context_pct.or_else(|| live.context_size.map(|s| live.context_tokens as f32 / s as f32 * 100.0))
 }
 
-/// A live session: the tool's icon in a ring that fills with the context (when its size is known),
-/// the session name, and one line of detail.
-#[allow(clippy::too_many_arguments)]
-fn live_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), live: &Live, now: i64, working: bool, accent: Color32) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
-    let p = ui.painter();
-    let c = pos2(r.min.x + 18.0, r.center().y);
-    let pct = pct_of(live);
-    match pct {
-        Some(v) => ring(p, c, 15.0, v / 100.0, context_color(v, theme), theme.header, 3.0),
-        None => ring(p, c, 15.0, 0.0, accent, theme.header, 3.0),
-    }
-    icon(p, c, 6.0);
-    let x = r.min.x + 44.0;
-    // Status on the right: a pulsing dot while the agent works.
-    let dot = if working {
-        let t = ui.input(|i| i.time) as f32;
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
-        c32(theme.palette[2]).gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs())
-    } else {
-        theme.muted.gamma_multiply(0.6)
-    };
-    p.circle_filled(pos2(r.max.x - 4.0, r.min.y + 12.0), 3.0, dot);
-    let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.min.y), pos2(r.max.x - 14.0, r.max.y)));
-    clip.text(pos2(x, r.min.y + 12.0), Align2::LEFT_CENTER, &live.label, FontId::proportional(12.5), theme.text);
-    let mut ctx_s = tokens(live.context_tokens);
-    if let Some(sz) = live.context_size {
-        ctx_s.push_str(&format!(" / {}", tokens(sz)));
-    }
-    let detail = format!("{}  ·  {ctx_s}  ·  {}", model_name(&live.model), ago(now, live.last_ts));
-    clip.text(pos2(x, r.min.y + 29.0), Align2::LEFT_CENTER, detail, FontId::proportional(11.0), theme.muted);
-    let here = if live.here { "" } else { "\nMost recent session; not in this pane's folder." };
-    resp.on_hover_text(format!("{} this session{here}", tokens(live.totals.iter().map(|m| m.total()).sum())));
-    if let Some(v) = pct.filter(|v| *v >= 50.0) {
-        let hint = if v >= 75.0 { "Context is nearly full: start a new session or /compact" } else { "Good moment to /compact" };
-        ui.horizontal(|ui| {
-            ui.add_space(44.0);
-            ui.label(RichText::new(hint).size(10.5).color(context_color(v, theme)));
-        });
+/// The agent is working: Claude Code's title starts with a Braille spinner while it works and with
+/// `✳` while it waits; for the others, it replied in the last two minutes.
+fn agent_working(a: &AgentPane, live: Option<&Live>, now: i64) -> bool {
+    match a.title.chars().next() {
+        Some(c) if ('\u{2800}'..='\u{28FF}').contains(&c) => true,
+        Some('✳') => false,
+        _ => live.is_some_and(|l| now - l.last_ts < 120),
     }
 }
 
-/// A tool with no open session: its icon and when it was last used.
+/// What an agent's pane is about: its title (the agents name the pane after the conversation),
+/// else the conversation's title, its folder, or its tab.
+fn agent_label(a: &AgentPane, d: Option<&PaneAgent>) -> String {
+    let generic = |t: &str| ["claude", "claude code", "codex", "agy", "antigravity"].contains(&t.to_lowercase().as_str());
+    crate::history::clean_title(&a.title)
+        .filter(|t| !generic(t))
+        .or_else(|| d.and_then(|d| d.live.as_ref()).map(|l| l.label.clone()).filter(|l| !l.is_empty() && l != "conversation" && l != "session"))
+        .or_else(|| d.and_then(|d| d.folder.clone()))
+        .unwrap_or_else(|| format!("Tab {}", a.tab + 1))
+}
+
+/// A pulsing green dot (keeps repainting while shown).
+fn working_dot(ui: &egui::Ui, p: &Painter, c: Pos2, theme: &Theme) {
+    let t = ui.input(|i| i.time) as f32;
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
+    p.circle_filled(c, 3.0, c32(theme.palette[2]).gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs()));
+}
+
+/// A fold arrow: pointing right when `open` is 0, down at 1.
+fn chevron(p: &Painter, c: Pos2, open: f32, color: Color32) {
+    let (sin, cos) = (open * PI / 2.0).sin_cos();
+    let at = |x: f32, y: f32| c + vec2(x * cos - y * sin, x * sin + y * cos);
+    p.add(Shape::line(vec![at(-1.5, -3.5), at(2.0, 0.0), at(-1.5, 3.5)], Stroke::new(1.4_f32, color)));
+}
+
+/// A tool with agents in S-term's panes: its icon, its name and how many run, folding a row per
+/// agent. Returns the pane of the row clicked.
+#[allow(clippy::too_many_arguments)]
+fn agent_group(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, agents: &[&AgentPane], data: &HashMap<u64, PaneAgent>, now: i64, focused: Option<u64>) -> Option<u64> {
+    let id = Id::new(("s-term-now", name));
+    let mut fold = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), CLICK);
+    if resp.clicked() {
+        fold.toggle(ui);
+    }
+    let open = fold.openness(ui.ctx());
+    let hover = ui.ctx().animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
+    // The snapshot's entry for a pane, unless another tool has started there since.
+    let entry = |a: &AgentPane| data.get(&a.pane).filter(|d| d.tool == a.tool);
+    let p = ui.painter();
+    if hover > 0.0 {
+        p.rect_filled(r, 8.0, theme.header.gamma_multiply(0.6 * hover));
+    }
+    let y = r.center().y;
+    icon(p, pos2(r.min.x + 18.0, y), 5.0);
+    let nr = p.text(pos2(r.min.x + 44.0, y), Align2::LEFT_CENTER, name, FontId::proportional(12.5), theme.text);
+    p.text(pos2(nr.max.x + 8.0, y), Align2::LEFT_CENTER, format!("{} running", agents.len()), FontId::proportional(11.0), theme.muted);
+    chevron(p, pos2(r.max.x - 9.0, y), open, lerp_color(theme.muted, theme.text, hover));
+    // Folded, the header still shows that one of them works.
+    if open < 0.5 && agents.iter().any(|a| agent_working(a, entry(a).and_then(|d| d.live.as_ref()), now)) {
+        working_dot(ui, p, pos2(r.max.x - 24.0, y), theme);
+    }
+    resp.on_hover_text(if fold.is_open() { "Hide the agents" } else { "Show the agents running in S-term" });
+    let mut go = None;
+    fold.show_body_unindented(ui, |ui| {
+        for a in agents {
+            if agent_row(ui, theme, icon, a, entry(a), now, focused == Some(a.pane)).clicked() {
+                go = Some(a.pane);
+            }
+        }
+    });
+    go
+}
+
+/// One agent: a ring that fills with its context window (the percentage inside, or the tool's icon
+/// while the window's size is unknown), what its pane is about, and its context, model and tab.
+#[allow(clippy::too_many_arguments)]
+fn agent_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), a: &AgentPane, d: Option<&PaneAgent>, now: i64, focused: bool) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), CLICK);
+    let live = d.and_then(|d| d.live.as_ref());
+    let hover = ui.ctx().animate_bool_with_time(Id::new(("s-term-now-agent", a.pane)), resp.hovered(), 0.1);
+    let p = ui.painter();
+    let bg = (if focused { 0.5_f32 } else { 0.0 }).max(0.7 * hover);
+    if bg > 0.0 {
+        p.rect_filled(r, 8.0, theme.header.gamma_multiply(bg));
+    }
+    let c = pos2(r.min.x + 18.0, r.center().y);
+    let track = lerp_color(theme.header, theme.border, 0.5);
+    let pct = live.and_then(pct_of);
+    match pct {
+        Some(v) => {
+            let col = context_color(v, theme);
+            ring(p, c, 12.5, v / 100.0, col, track, 2.5);
+            p.text(c, Align2::CENTER_CENTER, format!("{:.0}", v.min(999.0)), FontId::proportional(9.5), if v >= 50.0 { col } else { theme.text });
+        }
+        None => {
+            ring(p, c, 12.5, 0.0, track, track, 2.5);
+            icon(p, c, 4.2);
+        }
+    }
+    let x = r.min.x + 44.0;
+    let working = agent_working(a, live, now);
+    if working {
+        working_dot(ui, p, pos2(r.max.x - 6.0, r.min.y + 13.0), theme);
+    }
+    let label = agent_label(a, d);
+    let place = if focused { "this pane".to_string() } else { format!("tab {}", a.tab + 1) };
+    let ctx_s = live.map(|l| match l.context_size {
+        Some(sz) => format!("{} / {}", tokens(l.context_tokens), tokens(sz)),
+        None => format!("{} tokens", tokens(l.context_tokens)),
+    });
+    let detail = match (live, d) {
+        (Some(l), _) => format!("{}  ·  {}  ·  {place}", ctx_s.clone().unwrap_or_default(), model_name(&l.model)),
+        (None, Some(_)) => format!("no reply yet  ·  {place}"),
+        (None, None) => format!("reading…  ·  {place}"),
+    };
+    let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.min.y), pos2(r.max.x - 14.0, r.max.y)));
+    clip.text(pos2(x, r.min.y + 13.0), Align2::LEFT_CENTER, &label, FontId::proportional(12.0), theme.text);
+    clip.text(pos2(x, r.min.y + 28.5), Align2::LEFT_CENTER, detail, FontId::proportional(10.5), theme.muted);
+
+    let mut tip = vec![label];
+    let folder = d.and_then(|d| d.folder.as_deref()).map_or(String::new(), |f| format!("{f}  ·  "));
+    tip.push(format!("{folder}tab {}{}", a.tab + 1, if working { "  ·  working" } else { "" }));
+    if let Some(l) = live {
+        let used = ctx_s.unwrap_or_default();
+        tip.push(match pct {
+            Some(v) => format!("Context window: {v:.0}% used ({used})  ·  {}", model_name(&l.model)),
+            None => format!("Context: {used}  ·  {}", model_name(&l.model)),
+        });
+        tip.push(format!("Last reply {}  ·  {} this session", ago(now, l.last_ts), tokens(l.totals.iter().map(|m| m.total()).sum())));
+        if let Some(v) = pct.filter(|v| *v >= 50.0) {
+            tip.push(if v >= 75.0 { "Context is nearly full: start a new session or /compact" } else { "Good moment to /compact" }.into());
+        }
+    }
+    tip.push(if focused { "This is the focused pane".into() } else { "Click to go to this pane".into() });
+    resp.on_hover_text(tip.join("\n"))
+}
+
+/// A tool with no agent in S-term's panes: its icon and when it was last used.
 fn idle_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, last: Option<i64>, now: i64) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     let p = ui.painter();
     icon(p, pos2(r.min.x + 18.0, r.center().y), 5.0);
-    let when = last.map_or("no activity yet".to_string(), |t| format!("idle · {}", ago(now, t)));
+    // "Last active", not "idle": it may be running outside S-term.
+    let when = match last {
+        None => "no activity yet".to_string(),
+        Some(t) if now - t < 10 => "active now".to_string(),
+        Some(t) => format!("last active {}", ago(now, t)),
+    };
     p.text(pos2(r.min.x + 44.0, r.center().y), Align2::LEFT_CENTER, format!("{name}  ·  {when}"), FontId::proportional(11.5), theme.muted);
 }
 
-fn limit_row(ui: &mut egui::Ui, theme: &Theme, label: &str, l: &Limit, now: i64) {
-    let color = level_color(l.pct, theme);
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
-    let p = ui.painter();
-    let y = r.min.y + 8.0;
-    let g = p.layout_no_wrap(label.to_string(), FontId::proportional(11.5), theme.muted);
-    let lw = g.size().x;
-    p.galley(pos2(r.min.x, y - g.size().y / 2.0), g, theme.muted);
-    p.text(pos2(r.min.x + lw + 8.0, y), Align2::LEFT_CENTER, format!("{:.0}%", l.pct), FontId::proportional(12.0), color);
-    if let Some(t) = l.resets_at {
-        p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, format!("resets in {}", duration(t - now)), FontId::proportional(10.5), theme.muted);
-    }
-    thin_bar(p, Rect::from_min_max(pos2(r.min.x, r.max.y - 6.0), pos2(r.max.x, r.max.y - 2.0)), l.pct / 100.0, color, theme);
+/// One row of the plan-limits grid: a tool (or one of Antigravity's model groups) and its limits.
+struct LimitLine {
+    icon: fn(&Painter, Pos2, f32),
+    name: String,
+    /// What the tooltip calls it ("Antigravity · Gemini models").
+    full: String,
+    five_hour: Option<Limit>,
+    weekly: Option<Limit>,
+    updated: i64,
 }
 
-/// A tool's icon and name over its plan-limit rows, and when they were read.
-fn limits_head(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, updated: Option<i64>, now: i64) {
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
-    let p = ui.painter();
-    icon(p, pos2(r.min.x + 8.0, r.center().y), 4.6);
-    p.text(pos2(r.min.x + 19.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(11.5), theme.text);
-    if let Some(t) = updated {
-        p.text(pos2(r.max.x, r.center().y), Align2::RIGHT_CENTER, format!("updated {}", ago(now, t)), FontId::proportional(10.0), theme.muted.gamma_multiply(0.8));
-    }
+/// The plan-limits grid's columns across `r`: the name, then a 5-hour and a weekly cell.
+fn limit_cols(r: Rect) -> [Rect; 3] {
+    let name_w = (r.width() * 0.33).clamp(84.0, 120.0);
+    let gap = 14.0;
+    let cell = (r.width() - name_w - 2.0 * gap) / 2.0;
+    let col = |x: f32, w: f32| Rect::from_min_max(pos2(x, r.min.y), pos2(x + w, r.max.y));
+    [col(r.min.x, name_w), col(r.min.x + name_w + gap, cell), col(r.max.x - cell, cell)]
 }
 
-/// A model: dot, name, total, and a thin bar relative to the busiest model. Hover for the breakdown.
-fn model_row(ui: &mut egui::Ui, theme: &Theme, m: &ModelTotal, max_total: u64) {
-    let color = model_color(&m.model, theme);
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
+/// The grid's heading: the section's title, with the column names over the cells.
+fn limits_heading(ui: &mut egui::Ui, theme: &Theme) {
+    ui.add_space(18.0);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+    let [name, five, week] = limit_cols(r);
+    let (p, font, col) = (ui.painter(), FontId::proportional(10.5), theme.muted.gamma_multiply(0.9));
+    for (c, t) in [(name, "PLAN LIMITS"), (five, "5-HOUR"), (week, "WEEKLY")] {
+        p.text(pos2(c.min.x, r.center().y), Align2::LEFT_CENTER, t, font.clone(), col);
+    }
+    ui.add_space(6.0);
+}
+
+/// A row of the grid: icon and name, then each limit's percentage, time to reset and bar. Hover
+/// for the details and when they were read.
+fn limit_line(ui: &mut egui::Ui, theme: &Theme, l: &LimitLine, now: i64) {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+    let [name, five, week] = limit_cols(r);
     let p = ui.painter();
-    let y = r.min.y + 8.0;
-    p.circle_filled(pos2(r.min.x + 4.0, y), 3.0, color);
-    p.text(pos2(r.min.x + 14.0, y), Align2::LEFT_CENTER, model_name(&m.model), FontId::proportional(12.0), theme.text);
-    p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, tokens(m.total()), FontId::proportional(11.5), theme.muted);
-    let track = Rect::from_min_max(pos2(r.min.x + 14.0, r.max.y - 6.0), pos2(r.max.x, r.max.y - 3.0));
-    thin_bar(p, track, m.total() as f32 / max_total.max(1) as f32, color.gamma_multiply(0.85), theme);
+    let y = r.min.y + 9.0;
+    // A group with nothing used (0% and no reset under way) recedes.
+    let unused = [l.five_hour, l.weekly].iter().flatten().all(|x| x.at(now).pct < 0.5 && x.at(now).resets_at.is_none());
+    (l.icon)(p, pos2(name.min.x + 6.0, y), 4.6);
+    p.with_clip_rect(name).text(pos2(name.min.x + 17.0, y), Align2::LEFT_CENTER, &l.name, FontId::proportional(11.5), if unused { theme.muted } else { theme.text });
+    for (cell, lim) in [(five, l.five_hour), (week, l.weekly)] {
+        let Some(lim) = lim.map(|x| x.at(now)) else {
+            p.text(pos2(cell.min.x, y), Align2::LEFT_CENTER, "–", FontId::proportional(11.5), theme.muted.gamma_multiply(0.6));
+            continue;
+        };
+        let color = if lim.pct < 0.5 { theme.muted } else { level_color(lim.pct, theme) };
+        p.text(pos2(cell.min.x, y), Align2::LEFT_CENTER, format!("{:.0}%", lim.pct), FontId::proportional(12.0), color);
+        if let Some(t) = lim.resets_at {
+            p.text(pos2(cell.max.x, y), Align2::RIGHT_CENTER, duration(t - now), FontId::proportional(10.5), theme.muted);
+        }
+        thin_bar(p, Rect::from_min_max(pos2(cell.min.x, r.max.y - 9.0), pos2(cell.max.x, r.max.y - 6.0)), lim.pct / 100.0, color, theme);
+    }
     resp.on_hover_ui(|ui| {
-        ui.label(RichText::new(model_name(&m.model)).strong());
-        ui.label(RichText::new(&*m.model).size(11.0).color(theme.muted));
-        egui::Grid::new("tt").num_columns(2).show(ui, |ui| {
-            for (k, v) in [("input", m.input), ("cache write", m.cache_write), ("cache read", m.cache_read), ("output", m.output)] {
+        ui.label(RichText::new(&l.full).strong());
+        for (w, lim) in [("5-hour", l.five_hour), ("Weekly", l.weekly)] {
+            if let Some(lim) = lim.map(|x| x.at(now)) {
+                let reset = lim.resets_at.map(|t| format!(", resets in {}", duration(t - now))).unwrap_or_default();
+                ui.label(format!("{w} limit: {:.0}% used{reset}", lim.pct));
+            }
+        }
+        ui.label(RichText::new(format!("Updated {}", ago(now, l.updated))).size(11.0).color(theme.muted));
+    });
+}
+
+/// Claude Code's row while its limits are unknown: why, in place of the cells.
+fn limit_missing(ui: &mut egui::Ui, theme: &Theme, seen: bool) {
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    let [name, five, _] = limit_cols(r);
+    let p = ui.painter();
+    let y = r.center().y;
+    claude_icon(p, pos2(name.min.x + 6.0, y), 4.6);
+    p.with_clip_rect(name).text(pos2(name.min.x + 17.0, y), Align2::LEFT_CENTER, "Claude Code", FontId::proportional(11.5), theme.text);
+    let msg = if seen { "after its next reply" } else { "needs the status line" };
+    p.text(pos2(five.min.x, y), Align2::LEFT_CENTER, msg, FontId::proportional(11.0), theme.muted);
+    if !seen {
+        resp.on_hover_text("Set Claude Code's statusLine to `s-term statusline` to see your 5-hour and weekly limits (see the README).");
+    }
+}
+
+/// One model in the Usage list: its tokens across tools and ids (Antigravity has an id per effort
+/// level), under its display name.
+struct ModelLine<'a> {
+    name: String,
+    ids: Vec<&'a str>,
+    t: ModelTotal,
+}
+
+/// The models of `totals` merged by display name, busiest first.
+fn model_lines<'a>(totals: impl Iterator<Item = &'a ModelTotal>) -> Vec<ModelLine<'a>> {
+    let mut out: Vec<ModelLine> = Vec::new();
+    for m in totals {
+        let name = model_name(&m.model);
+        let Some(l) = out.iter_mut().find(|l| l.name == name) else {
+            out.push(ModelLine { name, ids: vec![&m.model], t: m.clone() });
+            continue;
+        };
+        l.ids.push(&m.model);
+        let t = &mut l.t;
+        (t.input, t.output, t.cache_read, t.cache_write, t.requests) = (t.input + m.input, t.output + m.output, t.cache_read + m.cache_read, t.cache_write + m.cache_write, t.requests + m.requests);
+        t.cost = match (t.cost, m.cost) {
+            (Some(mut a), Some(b)) => {
+                a += b;
+                Some(a)
+            }
+            (a, b) => a.or(b),
+        };
+    }
+    out.sort_by_key(|l| std::cmp::Reverse(l.t.total()));
+    out
+}
+
+/// One bar split between the models by their share of the tokens.
+fn share_bar(ui: &mut egui::Ui, theme: &Theme, lines: &[ModelLine]) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(r, 3.0, theme.header);
+    let total = lines.iter().map(|l| l.t.total()).sum::<u64>().max(1) as f32;
+    // Each model gets at least a sliver, so none disappears; a 2px gap separates them.
+    let shown: Vec<&ModelLine> = lines.iter().filter(|l| l.t.total() > 0).collect();
+    let room = r.width() - 2.0 * shown.len().saturating_sub(1) as f32;
+    let mut x = r.min.x;
+    for (i, l) in shown.iter().enumerate() {
+        let w = (room * l.t.total() as f32 / total).max(3.0).min(r.max.x - x);
+        let (first, last) = (i == 0, i + 1 == shown.len());
+        let rounding = egui::Rounding { nw: if first { 3.0 } else { 0.0 }, sw: if first { 3.0 } else { 0.0 }, ne: if last { 3.0 } else { 0.0 }, se: if last { 3.0 } else { 0.0 } };
+        let w = if last { r.max.x - x } else { w };
+        p.rect_filled(Rect::from_min_size(pos2(x, r.min.y), vec2(w, r.height())), rounding, model_color(l.ids[0], theme));
+        x += w + 2.0;
+    }
+}
+
+/// A model: dot, name, tokens and API cost. Hover for the breakdown.
+fn model_row(ui: &mut egui::Ui, theme: &Theme, l: &ModelLine, priced: bool) {
+    let m = &l.t;
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    let hover = ui.ctx().animate_bool_with_time(Id::new(("s-term-usage-model", &l.name)), resp.hovered(), 0.1);
+    let p = ui.painter();
+    if hover > 0.0 {
+        p.rect_filled(r.expand2(vec2(6.0, 0.0)), 6.0, theme.header.gamma_multiply(0.5 * hover));
+    }
+    let y = r.center().y;
+    // Fixed columns, so the numbers line up: tokens, then the cost at the right edge.
+    let cost_w = if priced { 68.0 } else { 0.0 };
+    p.circle_filled(pos2(r.min.x + 4.0, y), 3.0, model_color(l.ids[0], theme));
+    p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - cost_w - 52.0, r.max.y))).text(pos2(r.min.x + 14.0, y), Align2::LEFT_CENTER, &l.name, FontId::proportional(12.0), theme.text);
+    p.text(pos2(r.max.x - cost_w, y), Align2::RIGHT_CENTER, tokens(m.total()), FontId::proportional(11.5), theme.muted);
+    if let Some(c) = m.cost {
+        p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, usd(c.total()), FontId::proportional(11.5), theme.text);
+    } else if priced {
+        p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, "–", FontId::proportional(11.5), theme.muted.gamma_multiply(0.6));
+    }
+    resp.on_hover_ui(|ui| {
+        ui.label(RichText::new(&l.name).strong());
+        ui.label(RichText::new(l.ids.join(", ")).size(11.0).color(theme.muted));
+        egui::Grid::new("tt").num_columns(3).spacing(vec2(14.0, 4.0)).show(ui, |ui| {
+            let c = m.cost.unwrap_or_default();
+            for (k, v, cost) in [("input", m.input, c.input), ("cache write", m.cache_write, c.cache_write), ("cache read", m.cache_read, c.cache_read), ("output", m.output, c.output)] {
                 ui.label(k);
                 ui.label(RichText::new(tokens(v)));
+                ui.label(RichText::new(if m.cost.is_some() { usd(cost) } else { String::new() }).color(theme.muted));
                 ui.end_row();
             }
             ui.label("requests");
             ui.label(RichText::new(m.requests.to_string()));
             ui.end_row();
         });
+        ui.add_space(2.0);
+        let note = match m.cost {
+            Some(c) => format!("{} at API list prices", usd(c.total())),
+            None => "No API price known for this model".into(),
+        };
+        ui.label(RichText::new(note).size(11.0).color(theme.muted));
     });
 }
 
@@ -676,10 +942,12 @@ pub fn card(ui: &mut egui::Ui, theme: &Theme, add: impl FnOnce(&mut egui::Ui)) {
 // ------------------------------------------------------------------------------------------- public
 
 /// The AI tab: one flat page in four sections (now, plan limits, usage, activity). No cards.
-pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mut UsageUi, cfg: &mut Config) {
+/// `agents` are the AI CLIs in S-term's panes, in tab order; `focused` is the focused pane.
+/// Returns the pane to go to when one of the agents was clicked.
+pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mut UsageUi, cfg: &mut Config, agents: &[AgentPane], focused: Option<u64>) -> Option<u64> {
     let Some(s) = snap else {
         ui.label(RichText::new("Reading usage…").color(theme.muted));
-        return;
+        return None;
     };
     let claude = s.claude.installed && cfg.show_claude;
     let agy = s.agy.installed && cfg.show_antigravity;
@@ -692,105 +960,96 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
             "No AI tools are turned on. Pick the ones you use in Settings → AI tools."
         };
         ui.label(RichText::new(msg).color(theme.muted));
-        return;
+        return None;
     }
-    let tools: Vec<(&ToolStats, &str, fn(&Painter, Pos2, f32), Color32)> = [
-        (claude, &s.claude, "Claude Code", claude_icon as fn(&Painter, Pos2, f32), CLAUDE_ORANGE),
-        (codex, &s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL),
-        (agy, &s.agy, "Antigravity", antigravity_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE),
+    // (stats, name, icon, process name as `AgentPane::tool` has it)
+    let tools: Vec<(&ToolStats, &str, fn(&Painter, Pos2, f32), &str)> = [
+        (claude, &s.claude, "Claude Code", claude_icon as fn(&Painter, Pos2, f32), "claude"),
+        (codex, &s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), "codex"),
+        (agy, &s.agy, "Antigravity", antigravity_icon as fn(&Painter, Pos2, f32), "agy"),
     ]
     .into_iter()
     .filter(|t| t.0)
-    .map(|(_, st, n, i, a)| (st, n, i, a))
+    .map(|(_, st, n, i, k)| (st, n, i, k))
     .collect();
 
-    // ---- now
+    // ---- now: each tool, folding a row per agent it runs in S-term's panes (in any tab)
     ui.add_space(-10.0);
     section(ui, theme, "NOW", |_| {});
-    for (st, name, icon, accent) in &tools {
-        match &st.live {
-            Some(l) => live_row(ui, theme, *icon, l, s.now, s.now - l.last_ts < 120, *accent),
-            None => idle_row(ui, theme, *icon, name, st.last_active, s.now),
+    let data = state.demo.as_ref().unwrap_or(&s.agents);
+    let mut go = None;
+    for (st, name, icon, key) in &tools {
+        let mine: Vec<&AgentPane> = agents.iter().filter(|a| a.tool == *key).collect();
+        if mine.is_empty() {
+            idle_row(ui, theme, *icon, name, st.last_active, s.now);
+        } else {
+            go = agent_group(ui, theme, *icon, name, &mine, data, s.now, focused).or(go);
         }
         ui.add_space(2.0);
     }
 
-    // ---- plan limits: Claude Code's from its status line, Antigravity's from `agy -p /usage`.
-    // With both, each tool gets a heading row that says when its limits were read.
+    // ---- plan limits: one grid row per tool, or per Antigravity model group, with its 5-hour and
+    // weekly limit. Claude Code's come from its status line, Antigravity's from `agy -p /usage`.
+    // A limit whose reset time has passed reads 0% until the tool reports again (`Limit::at`).
     let quota = s.agy_quota.as_deref().filter(|q| agy && !q.groups.is_empty());
     let claude_lim = s.limits.as_ref().filter(|l| l.five_hour.is_some() || l.seven_day.is_some());
-    let both = claude && quota.is_some();
     if claude || quota.is_some() {
-        let updated = if both { None } else if claude { claude_lim.map(|l| l.updated) } else { quota.map(|q| q.updated) };
-        section(ui, theme, "PLAN LIMITS", |ui| {
-            if let Some(t) = updated {
-                ui.label(RichText::new(format!("updated {}", ago(s.now, t))).size(10.0).color(theme.muted.gamma_multiply(0.8)));
-            }
-        });
+        limits_heading(ui, theme);
     }
     if claude {
-        if both {
-            limits_head(ui, theme, claude_icon, "Claude Code", claude_lim.map(|l| l.updated), s.now);
-        }
         match claude_lim {
             Some(l) => {
-                // A window whose reset time has passed reads 0% until Claude Code reports again.
-                if let Some(w) = l.five_hour {
-                    limit_row(ui, theme, "5-hour", &w.at(s.now), s.now);
-                }
-                if let Some(w) = l.seven_day {
-                    ui.add_space(4.0);
-                    limit_row(ui, theme, "Weekly", &w.at(s.now), s.now);
-                }
+                let line = LimitLine { icon: claude_icon, name: "Claude Code".into(), full: "Claude Code".into(), five_hour: l.five_hour, weekly: l.seven_day, updated: l.updated };
+                limit_line(ui, theme, &line, s.now);
             }
-            None => {
-                let msg = if s.statusline_seen {
-                    "Plan limits appear after Claude Code's next reply."
-                } else {
-                    "Set Claude Code's statusLine to `s-term statusline` to see your 5-hour and weekly limits (see README)."
-                };
-                ui.label(RichText::new(msg).size(11.0).color(theme.muted));
-            }
+            None => limit_missing(ui, theme, s.statusline_seen),
         }
     }
-    if let Some(q) = quota {
-        if both {
-            ui.add_space(8.0);
-            limits_head(ui, theme, antigravity_icon, "Antigravity", Some(q.updated), s.now);
-        }
-        let mut first = true;
-        for g in &q.groups {
-            for (w, l) in [("5-hour", g.five_hour), ("Weekly", g.weekly)] {
-                let Some(l) = l else { continue };
-                if !first {
-                    ui.add_space(4.0);
-                }
-                first = false;
-                limit_row(ui, theme, &format!("{} · {w}", g.short_name()), &l.at(s.now), s.now);
-            }
-        }
+    for g in quota.map(|q| q.groups.as_slice()).unwrap_or_default() {
+        let name = g.short_name().replace(" and ", " & ");
+        let line = LimitLine { icon: antigravity_icon, full: format!("Antigravity · {}", g.name.trim()), name, five_hour: g.five_hour, weekly: g.weekly, updated: quota.map_or(0, |q| q.updated) };
+        limit_line(ui, theme, &line, s.now);
     }
 
     // ---- usage: one total, one list of models across tools, one 24h chart
     section(ui, theme, "USAGE", |ui| window_picker(ui, theme, state));
-    let mut models: Vec<&ModelTotal> = tools.iter().flat_map(|(st, ..)| st.windows.get(&state.window).map(|v| v.iter()).into_iter().flatten()).collect();
-    models.sort_by_key(|m| std::cmp::Reverse(m.total()));
-    let total: u64 = models.iter().map(|m| m.total()).sum();
-    let output: u64 = models.iter().map(|m| m.output).sum();
+    let models = model_lines(tools.iter().flat_map(|(st, ..)| st.windows.get(&state.window).map(|v| v.iter()).into_iter().flatten()));
+    let total: u64 = models.iter().map(|m| m.t.total()).sum();
+    let output: u64 = models.iter().map(|m| m.t.output).sum();
+    // What the same tokens would cost on the pay-as-you-go APIs, for the models with a known price.
+    let cost = models.iter().filter_map(|m| m.t.cost.map(|c| c.total())).reduce(|a, b| a + b);
+    let unpriced: Vec<&str> = models.iter().filter(|m| m.t.cost.is_none()).map(|m| m.name.as_str()).collect();
     ui.horizontal(|ui| {
         ui.label(RichText::new(tokens(total)).size(22.0).strong().color(theme.text));
         ui.label(RichText::new("tokens").size(11.0).color(theme.muted));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(format!("{} output", tokens(output))).size(11.0).color(theme.muted));
-        });
+        if let Some(c) = cost {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let tip = format!(
+                    "What these tokens would cost on the providers' pay-as-you-go APIs, at Anthropic's, OpenAI's and Google's list prices. Your plan bills differently.{}",
+                    if unpriced.is_empty() { String::new() } else { format!("\n\nNo API price known for: {}", unpriced.join(", ")) }
+                );
+                ui.label(RichText::new(usd(c)).size(22.0).strong().color(theme.text)).on_hover_text(tip);
+            });
+        }
     });
-    ui.add_space(6.0);
+    ui.add_space(-4.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("{} output", tokens(output))).size(10.5).color(theme.muted));
+        if cost.is_some() {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new("API equivalent").size(10.5).color(theme.muted));
+            });
+        }
+    });
+    ui.add_space(10.0);
     if models.is_empty() {
         ui.label(RichText::new("No usage in this period.").size(11.5).color(theme.muted));
+    } else {
+        share_bar(ui, theme, &models);
+        ui.add_space(6.0);
     }
-    let max = models.first().map_or(1, |m| m.total());
     for m in &models {
-        model_row(ui, theme, m, max);
+        model_row(ui, theme, m, cost.is_some());
     }
     let mut hourly = [0u64; 24];
     for (st, ..) in &tools {
@@ -799,7 +1058,7 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
         }
     }
     let sessions: usize = tools.iter().map(|(st, ..)| st.sessions_today).sum();
-    ui.add_space(10.0);
+    ui.add_space(16.0);
     sparkline(ui, theme, &hourly, theme.accent);
     ui.add_space(3.0);
     ui.horizontal(|ui| {
@@ -812,6 +1071,7 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
     // ---- activity
     heatmap(ui, theme, s, state, &mut cfg.heat_metric);
     ui.add_space(12.0);
+    go
 }
 
 /// Status-bar meter for one AI CLI: the one in the focused pane (`fg` is its foreground program),
@@ -946,7 +1206,18 @@ fn meter_tool(fg: Option<&str>, tools: [(bool, bool); 3]) -> Option<&'static str
 
 #[cfg(test)]
 mod tests {
-    use super::meter_tool;
+    use super::{meter_tool, usd};
+
+    #[test]
+    fn usd_format() {
+        assert_eq!(usd(0.0), "$0.00");
+        assert_eq!(usd(0.0039), "<$0.01");
+        assert_eq!(usd(0.72), "$0.72");
+        assert_eq!(usd(140.584), "$140.58");
+        assert_eq!(usd(1234.4), "$1,234");
+        assert_eq!(usd(20_005.0), "$20,005");
+        assert_eq!(usd(2_500_000.0), "$2.50M");
+    }
 
     #[test]
     fn meter_follows_focused_pane() {
