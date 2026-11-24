@@ -4,13 +4,16 @@
 //!   read incrementally (only appended bytes). Plan rate limits (5h / weekly) and the exact context
 //!   window come from `s-term statusline`, which Claude Code calls with its status-line JSON.
 //! - Antigravity CLI: per-step usage stored as protobuf blobs in its SQLite conversation databases
-//!   (`~/.gemini/antigravity-cli/conversations/*.db`), opened read-only.
+//!   (`~/.gemini/antigravity-cli/conversations/*.db`), opened read-only. Its plan quota (5-hour and
+//!   weekly, per model group) comes from the CLI's own `agy -p /usage --output-format json`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -95,6 +98,67 @@ pub struct Limit {
     pub resets_at: Option<i64>,
 }
 
+impl Limit {
+    /// The limit as of `now`: once its reset time has passed it is back to 0% used.
+    pub fn at(self, now: i64) -> Limit {
+        if self.resets_at.is_some_and(|t| t <= now) {
+            Limit { pct: 0.0, resets_at: None }
+        } else {
+            self
+        }
+    }
+}
+
+/// One group of Antigravity models that share a 5-hour and a weekly limit.
+pub struct QuotaGroup {
+    /// As Antigravity names it ("Gemini Models", "Claude and GPT models").
+    pub name: String,
+    /// The group's models as `model_key`s ("gemini-4-neon", "claude-opus-5-5"), to match model ids.
+    pub models: Vec<String>,
+    pub five_hour: Option<Limit>,
+    pub weekly: Option<Limit>,
+}
+
+impl QuotaGroup {
+    /// The name without its trailing "models": "Gemini", "Claude and GPT".
+    pub fn short_name(&self) -> &str {
+        let n = self.name.trim();
+        n.strip_suffix(" Models").or_else(|| n.strip_suffix(" models")).unwrap_or(n)
+    }
+
+    fn covers(&self, model: &str) -> bool {
+        let m = model_key(model);
+        self.models.iter().any(|k| !k.is_empty() && m.contains(k.as_str()))
+    }
+}
+
+/// Antigravity's plan quota, as `agy -p /usage` reports it.
+pub struct AgyQuota {
+    pub groups: Vec<QuotaGroup>,
+    pub updated: i64,
+}
+
+impl AgyQuota {
+    /// The group `model` belongs to, else the one whose 5-hour limit is most used.
+    pub fn group_for(&self, model: Option<&str>, now: i64) -> Option<&QuotaGroup> {
+        let used = |g: &QuotaGroup| g.five_hour.map_or(0.0, |l| l.at(now).pct);
+        model.and_then(|m| self.groups.iter().find(|g| g.covers(m))).or_else(|| self.groups.iter().max_by(|a, b| used(a).total_cmp(&used(b))))
+    }
+}
+
+/// Lowercase, with every run of other characters as one dash: "Claude Opus 5.5" -> "claude-opus-5-5".
+fn model_key(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
 pub struct Limits {
     pub five_hour: Option<Limit>,
     pub seven_day: Option<Limit>,
@@ -123,6 +187,8 @@ pub struct Snapshot {
     pub limits: Option<Limits>,
     /// `s-term statusline` has written at least once (the hook is set up).
     pub statusline_seen: bool,
+    /// Antigravity's plan quota, once `agy -p /usage` has answered.
+    pub agy_quota: Option<Arc<AgyQuota>>,
 }
 
 // ------------------------------------------------------------------------------------------ helpers
@@ -465,10 +531,10 @@ impl ClaudeScanner {
     }
 }
 
-/// Latest status-line JSON per session id, plus the newest one overall.
-fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Value>, bool) {
+/// Latest status-line JSON per session id, the plan limits from all of them, and whether any exist.
+fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Limits>, bool) {
     let mut map = HashMap::new();
-    let mut newest: Option<(i64, Value)> = None;
+    let mut reports: Vec<(i64, Value)> = Vec::new();
     let mut any = false;
     if let Ok(rd) = std::fs::read_dir(status_dir()) {
         for e in rd.flatten() {
@@ -483,8 +549,8 @@ fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Value>, bool) 
                 continue;
             }
             let Ok(v) = std::fs::read(&p).map_err(|_| ()).and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ())) else { continue };
-            if !v["rate_limits"].is_null() && newest.as_ref().is_none_or(|(nt, _)| t > *nt) {
-                newest = Some((t, v.clone()));
+            if !v["rate_limits"].is_null() {
+                reports.push((t, v["rate_limits"].clone()));
             }
             if t >= now - STATUS_FRESH_SECS {
                 if let Some(id) = v["session_id"].as_str() {
@@ -493,21 +559,27 @@ fn read_status_files(now: i64) -> (HashMap<String, Value>, Option<Value>, bool) 
             }
         }
     }
-    (map, newest.map(|(t, mut v)| {
-        v["_mtime"] = t.into();
-        v
-    }), any)
+    (map, merge_limits(&reports), any)
 }
 
-fn limits_from(v: &Value) -> Limits {
-    let lim = |w: &Value| {
-        Some(Limit { pct: w["used_percentage"].as_f64()? as f32, resets_at: w["resets_at"].as_i64().or_else(|| w["resets_at"].as_f64().map(|x| x as i64)) })
+/// Plan limits from every saved status line, as (file time, `rate_limits`). Each Claude Code session
+/// reports the limits from its own last reply, so an idle session can write an older reading after a
+/// newer one. Usage only grows within a window, so per window the latest one (by reset time) wins and,
+/// in it, the highest percentage. `updated` is the last report from those windows.
+fn merge_limits(reports: &[(i64, Value)]) -> Option<Limits> {
+    let lim = |w: &Value| Some(Limit { pct: w["used_percentage"].as_f64()? as f32, resets_at: w["resets_at"].as_i64().or_else(|| w["resets_at"].as_f64().map(|x| x as i64)) });
+    let pick = |key: &str| -> Option<(Limit, i64)> {
+        let all: Vec<(Limit, i64)> = reports.iter().filter_map(|(t, v)| lim(&v[key]).map(|l| (l, *t))).collect();
+        let last = all.iter().filter_map(|(l, _)| l.resets_at).max();
+        // Reset times of one window can differ by a few seconds between replies.
+        let current: Vec<(Limit, i64)> = all.into_iter().filter(|(l, _)| last.is_none_or(|m| l.resets_at.is_some_and(|r| r >= m - 600))).collect();
+        let updated = current.iter().map(|(_, t)| *t).max()?;
+        let top = current.into_iter().map(|(l, _)| l).max_by(|a, b| a.pct.total_cmp(&b.pct))?;
+        Some((top, updated))
     };
-    Limits {
-        five_hour: lim(&v["rate_limits"]["five_hour"]),
-        seven_day: lim(&v["rate_limits"]["seven_day"]),
-        updated: v["_mtime"].as_i64().unwrap_or(0),
-    }
+    let (five, week) = (pick("five_hour"), pick("seven_day"));
+    let updated = five.map(|f| f.1).max(week.map(|w| w.1))?;
+    Some(Limits { five_hour: five.map(|f| f.0), seven_day: week.map(|w| w.0), updated })
 }
 
 // -------------------------------------------------------------------------------- Antigravity CLI
@@ -575,6 +647,8 @@ mod pb {
 struct AgyConv {
     stamp: (Option<i64>, Option<i64>),
     recs: Vec<Rec>,
+    /// Antigravity's own view of the context at the last generation: (tokens used, window size).
+    context: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -602,11 +676,12 @@ impl AgyScanner {
         self.models.entry(s.to_string()).or_insert_with(|| Arc::from(s)).clone()
     }
 
-    fn load(&mut self, path: &Path) -> Option<Vec<Rec>> {
+    fn load(&mut self, path: &Path) -> Option<AgyConv> {
         let c = Self::open(path)?;
         // Model enum -> name, learned from the generation requests.
         let mut names: HashMap<u64, String> = HashMap::new();
         let mut fallback = None;
+        let mut context = None;
         {
             let mut st = c.prepare("select data from gen_metadata order by idx").ok()?;
             let rows = st.query_map([], |r| r.get::<_, Vec<u8>>(0)).ok()?;
@@ -618,6 +693,12 @@ impl AgyScanner {
                 }
                 if name.is_some() {
                     fallback = name;
+                }
+                // chat_model.chat_start_metadata.context_window_metadata: 1 estimated_tokens_used, 4 max_context_tokens.
+                if let Some(cw) = pb::msg(&data, 1).and_then(|m| pb::msg(m, 9)).and_then(|s| pb::msg(s, 10)) {
+                    if let (Some(used), Some(max)) = (pb::int(cw, 1), pb::int(cw, 4).filter(|m| *m > 0)) {
+                        context = Some((used, max));
+                    }
                 }
             }
         }
@@ -631,11 +712,8 @@ impl AgyScanner {
             let name = pb::int(u, 1).and_then(|id| names.get(&id).cloned()).or_else(|| fallback.clone()).unwrap_or_else(|| "gemini".into());
             raw.push((ts, name, g(2), g(3), g(5), g(4)));
         }
-        Some(
-            raw.into_iter()
-                .map(|(ts, name, input, output, cache_read, cache_write)| Rec { ts, model: self.intern(&name), input, output, cache_read, cache_write })
-                .collect(),
-        )
+        let recs = raw.into_iter().map(|(ts, name, input, output, cache_read, cache_write)| Rec { ts, model: self.intern(&name), input, output, cache_read, cache_write }).collect();
+        Some(AgyConv { stamp: (None, None), recs, context })
     }
 
     fn scan(&mut self, now: i64) -> bool {
@@ -660,8 +738,8 @@ impl AgyScanner {
                 if self.convs.get(&p).is_some_and(|c| c.stamp == stamp) {
                     continue;
                 }
-                if let Some(recs) = self.load(&p) {
-                    self.convs.insert(p, AgyConv { stamp, recs });
+                if let Some(conv) = self.load(&p) {
+                    self.convs.insert(p, AgyConv { stamp, ..conv });
                 }
             }
         }
@@ -704,8 +782,9 @@ impl AgyScanner {
             st.live = Some(Live {
                 label,
                 model: latest.model.clone(),
-                context_tokens: latest.context(),
-                context_size: None,
+                // Antigravity's own count against its window (what it compacts by), else the last request's input.
+                context_tokens: c.context.map_or(latest.context(), |(used, _)| used),
+                context_size: c.context.map(|(_, max)| max),
                 context_pct: None,
                 last_ts: last,
                 requests: c.recs.len() as u32,
@@ -717,6 +796,104 @@ impl AgyScanner {
     }
 }
 
+/// Polls Antigravity's plan quota by running `agy -p /usage --output-format json`: the CLI's own
+/// report, so S-term never touches its login. Every minute while `agy` runs (right away when it
+/// starts), every 10 minutes otherwise. The child runs in the background and is checked on each
+/// usage refresh; `--log-file /dev/null` keeps it from leaving a log behind every time.
+#[derive(Default)]
+struct AgyQuotaPoll {
+    child: Option<(Child, Instant)>,
+    last: Option<Instant>,
+    was_running: bool,
+    quota: Option<Arc<AgyQuota>>,
+}
+
+impl AgyQuotaPoll {
+    const RUNNING_EVERY: Duration = Duration::from_secs(60);
+    const IDLE_EVERY: Duration = Duration::from_secs(600);
+    const TIMEOUT: Duration = Duration::from_secs(30);
+
+    fn tick(&mut self, enabled: bool, running: bool) {
+        if let Some((child, started)) = &mut self.child {
+            let done = match child.try_wait() {
+                Ok(Some(_)) => {
+                    let mut out = String::new();
+                    if let Some(mut o) = child.stdout.take() {
+                        let _ = o.read_to_string(&mut out);
+                    }
+                    if let Some(q) = parse_agy_quota(&out, now_secs()) {
+                        self.quota = Some(Arc::new(q));
+                    }
+                    true
+                }
+                Ok(None) if started.elapsed() > Self::TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    true
+                }
+                Ok(None) => false,
+                Err(_) => true,
+            };
+            if done {
+                self.child = None;
+            }
+        }
+        let due = |every: Duration| self.last.is_none_or(|t| t.elapsed() >= every);
+        let started = running && !self.was_running;
+        if enabled && self.child.is_none() && (started || due(if running { Self::RUNNING_EVERY } else { Self::IDLE_EVERY })) {
+            self.last = Some(Instant::now());
+            self.child = spawn_agy_usage().map(|c| (c, Instant::now()));
+        }
+        self.was_running = running;
+    }
+}
+
+fn spawn_agy_usage() -> Option<Child> {
+    // A desktop launch may not have ~/.local/bin (where agy installs itself) on PATH.
+    let paths = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default();
+    let bin = paths.into_iter().chain([home().join(".local/bin")]).map(|d| d.join("agy")).find(|p| p.is_file())?;
+    Command::new(bin)
+        .args(["-p", "/usage", "--output-format", "json", "--log-file", "/dev/null"])
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
+/// Reads `agy -p /usage --output-format json`: `command.data.groups[]`, each with a `description`
+/// listing its models and `buckets` with a `window` ("5h" / "weekly"), `remaining_fraction` and
+/// `reset_time`.
+fn parse_agy_quota(out: &str, now: i64) -> Option<AgyQuota> {
+    let v: Value = serde_json::from_str(out.trim()).ok()?;
+    let groups = v["command"]["data"]["groups"].as_array()?;
+    let groups: Vec<QuotaGroup> = groups
+        .iter()
+        .filter_map(|g| {
+            let desc = g["description"].as_str().unwrap_or("");
+            let models = desc.rsplit(':').next().unwrap_or("").split(',').map(model_key).filter(|k| !k.is_empty()).collect();
+            let mut q = QuotaGroup { name: g["name"].as_str()?.to_string(), models, five_hour: None, weekly: None };
+            for b in g["buckets"].as_array()? {
+                if b["disabled"].as_bool() == Some(true) {
+                    continue;
+                }
+                // A bucket with nothing left may leave out a zero fraction.
+                let Some(left) = b["remaining_fraction"].as_f64().or_else(|| b.get("remaining_amount").is_none().then_some(0.0)) else { continue };
+                // An untouched bucket's reset time is just its window from now: leave it out.
+                let resets_at = b["reset_time"].as_str().and_then(parse_ts).filter(|_| left < 1.0);
+                let l = Limit { pct: ((1.0 - left) * 100.0).clamp(0.0, 100.0) as f32, resets_at };
+                match b["window"].as_str().unwrap_or("") {
+                    "5h" => q.five_hour = Some(l),
+                    "weekly" => q.weekly = Some(l),
+                    _ => {}
+                }
+            }
+            (q.five_hour.is_some() || q.weekly.is_some()).then_some(q)
+        })
+        .collect();
+    (!groups.is_empty()).then_some(AgyQuota { groups, updated: now })
+}
 
 // ------------------------------------------------------------------------------------------- Codex
 
@@ -872,6 +1049,8 @@ impl CodexScanner {
 pub struct Usage {
     shared: Arc<Mutex<Option<Arc<Snapshot>>>>,
     focus: Arc<Mutex<Option<PathBuf>>>,
+    /// Antigravity is turned on in Settings, so its quota is polled.
+    agy_quota: Arc<AtomicBool>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -882,7 +1061,8 @@ impl Usage {
     pub fn new(ctx: egui::Context) -> Self {
         let shared: Arc<Mutex<Option<Arc<Snapshot>>>> = Arc::default();
         let focus: Arc<Mutex<Option<PathBuf>>> = Arc::default();
-        let (s2, f2) = (shared.clone(), focus.clone());
+        let agy_quota: Arc<AtomicBool> = Arc::default();
+        let (s2, f2, q2) = (shared.clone(), focus.clone(), agy_quota.clone());
         std::thread::Builder::new()
             .name("s-term-usage".into())
             .spawn(move || {
@@ -890,10 +1070,11 @@ impl Usage {
                 let mut agy = AgyScanner::default();
                 let mut codex = CodexScanner::default();
                 let mut ledger = Ledger::load();
+                let mut quota = AgyQuotaPoll::default();
                 loop {
                     let now = now_secs();
                     let focus = lock(&f2).clone();
-                    let (status, newest, seen) = read_status_files(now);
+                    let (status, limits, seen) = read_status_files(now);
                     let claude_installed = claude.scan(now);
                     let agy_installed = agy.scan(now);
                     let mut c = claude.stats(now, focus.as_deref(), &status);
@@ -905,6 +1086,7 @@ impl Usage {
                     x.installed = codex_installed;
                     let procs = running_procs(&["claude", "agy", "codex"]);
                     (c.running, a.running, x.running) = (procs[0], procs[1], procs[2]);
+                    quota.tick(q2.load(Ordering::Relaxed), procs[1]);
                     let fresh = daily_from(
                         claude
                             .files
@@ -921,8 +1103,9 @@ impl Usage {
                         claude: c,
                         agy: a,
                         codex: x,
-                        limits: newest.as_ref().map(limits_from),
+                        limits,
                         statusline_seen: seen,
+                        agy_quota: quota.quota.clone(),
                     };
                     *lock(&s2) = Some(Arc::new(snap));
                     ctx.request_repaint();
@@ -934,7 +1117,7 @@ impl Usage {
                 }
             })
             .expect("spawn usage thread");
-        Self { shared, focus }
+        Self { shared, focus, agy_quota }
     }
 
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
@@ -943,6 +1126,11 @@ impl Usage {
 
     pub fn set_focus(&self, cwd: Option<PathBuf>) {
         *lock(&self.focus) = cwd;
+    }
+
+    /// Whether to poll Antigravity's quota (only while the tool is turned on in Settings).
+    pub fn set_agy_quota(&self, on: bool) {
+        self.agy_quota.store(on, Ordering::Relaxed);
     }
 }
 
@@ -982,7 +1170,7 @@ pub fn statusline_main() -> std::io::Result<()> {
 pub fn report_main() {
     let now = now_secs();
     let focus = std::env::current_dir().ok();
-    let (status, newest, _) = read_status_files(now);
+    let (status, limits, _) = read_status_files(now);
     let mut claude = ClaudeScanner::default();
     let mut agy = AgyScanner::default();
     let mut codex = CodexScanner::default();
@@ -998,7 +1186,7 @@ pub fn report_main() {
         };
         println!("{name}  ({} sessions today)", st.sessions_today);
         if let Some(l) = &st.live {
-            println!("  live: {} · {} · {} requests · context {} tokens{}", l.label, l.model, l.requests, l.context_tokens, l.context_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default());
+            println!("  live: {} · {} · {} requests · context {} tokens{}{}", l.label, l.model, l.requests, l.context_tokens, l.context_size.map(|s| format!(" of {s}")).unwrap_or_default(), l.context_pct.map(|p| format!(" ({p:.0}%)")).unwrap_or_default());
         }
         for (w, label) in [(Window::FiveHours, "5h"), (Window::Today, "today"), (Window::Week, "7d")] {
             for m in &st.windows[&w] {
@@ -1007,9 +1195,19 @@ pub fn report_main() {
         }
         println!();
     }
-    if let Some(v) = newest {
-        let l = limits_from(&v);
-        println!("Limits: 5h {:?}%  week {:?}%", l.five_hour.map(|x| x.pct), l.seven_day.map(|x| x.pct));
+    if let Some(l) = limits {
+        let pct = |l: Option<Limit>| l.map_or("-".into(), |l| format!("{:.0}%", l.at(now).pct));
+        println!("Claude Code limits: 5h {}  week {}  (updated {}s ago)", pct(l.five_hour), pct(l.seven_day), now - l.updated);
+    }
+    let out = spawn_agy_usage().and_then(|c| c.wait_with_output().ok()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    match out.as_deref().and_then(|o| parse_agy_quota(o, now)) {
+        Some(q) => {
+            for g in &q.groups {
+                let pct = |l: Option<Limit>| l.map_or("-".into(), |l| format!("{:.0}%", l.at(now).pct));
+                println!("Antigravity limits, {}: 5h {}  week {}  ({})", g.name, pct(g.five_hour), pct(g.weekly), g.models.join(" "));
+            }
+        }
+        None => println!("Antigravity limits: not available"),
     }
 }
 
@@ -1038,6 +1236,62 @@ mod tests {
         assert_eq!(r.context(), 1000);
         assert_eq!(f.context_window, Some(272000));
         assert_eq!(f.cwd.as_deref(), Some("/home/u/proj"));
+    }
+
+    #[test]
+    fn claude_limits_merge() {
+        let rl = |five: f64, five_reset: i64, week: f64, week_reset: i64| serde_json::json!({"five_hour": {"used_percentage": five, "resets_at": five_reset}, "seven_day": {"used_percentage": week, "resets_at": week_reset}});
+        // An idle session writes its older reading (8%) after a newer one (9%): the higher one stays.
+        let r = [(100, rl(9.0, 5000, 91.0, 9000)), (108, rl(8.0, 5000, 90.0, 9000))];
+        let l = merge_limits(&r).unwrap();
+        assert_eq!((l.five_hour.unwrap().pct, l.seven_day.unwrap().pct, l.updated), (9.0, 91.0, 108));
+        // A new window wins over a fuller old one, even when the old one was written later.
+        let r = [(200, rl(2.0, 20000, 1.0, 600000)), (300, rl(30.0, 5000, 93.0, 9000))];
+        let l = merge_limits(&r).unwrap();
+        assert_eq!((l.five_hour.unwrap().pct, l.seven_day.unwrap().pct, l.updated), (2.0, 1.0, 200));
+        assert!(merge_limits(&[]).is_none());
+        // Past its reset time a window reads 0%.
+        let week = Limit { pct: 93.0, resets_at: Some(9000) };
+        assert_eq!((week.at(8999).pct, week.at(9000).pct), (93.0, 0.0));
+    }
+
+    #[test]
+    fn agy_quota() {
+        // Trimmed from `agy -p /usage --output-format json` (Antigravity CLI 1.5.16).
+        let out = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[
+            {"name":"Gemini Models","description":"Models within this group: Gemini 4 Neon, Orchestrator (Neon), Gemini 3.8 Flash","buckets":[
+                {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.6845,"reset_time":"2026-11-30T22:56:42Z"},
+                {"id":"gemini-5h","window":"5h","remaining_fraction":0.0693,"reset_time":"2026-11-24T22:21:18Z"}]},
+            {"name":"Claude and GPT models","description":"Models within this group: Claude Opus 5.5, GPT-OSS 120B","buckets":[
+                {"id":"3p-weekly","window":"weekly","remaining_fraction":1,"reset_time":"2026-12-01T21:24:38Z"},
+                {"id":"3p-5h","window":"5h","reset_time":"2026-11-25T02:24:38Z"},
+                {"id":"3p-other","window":"daily","remaining_fraction":0.5,"disabled":true}]}]}}}"#;
+        let now = parse_ts("2026-11-24T21:30:00Z").unwrap();
+        let q = parse_agy_quota(out, now).unwrap();
+        assert_eq!(q.groups.len(), 2);
+        let (g, c) = (&q.groups[0], &q.groups[1]);
+        assert_eq!(g.short_name(), "Gemini");
+        assert_eq!(c.short_name(), "Claude and GPT");
+        assert_eq!(g.models, ["gemini-4-neon", "orchestrator-neon", "gemini-3-8-flash"]);
+        assert!((g.five_hour.unwrap().pct - 93.07).abs() < 0.01);
+        assert!((g.weekly.unwrap().pct - 31.55).abs() < 0.01);
+        // A bucket without a fraction has nothing left.
+        assert_eq!(c.five_hour.unwrap().pct, 100.0);
+        assert_eq!(c.weekly.unwrap().pct, 0.0);
+        assert_eq!(c.weekly.unwrap().resets_at, None);
+        assert!(g.weekly.unwrap().resets_at.is_some());
+        // Model ids find their group; with none, the busiest 5-hour limit is shown.
+        let name = |m| q.group_for(m, now).map(|g| g.short_name());
+        assert_eq!(name(Some("gemini-4-neon-high")), Some("Gemini"));
+        assert_eq!(name(Some("gemini-pro-orchestrator-neon")), Some("Gemini"));
+        assert_eq!(name(Some("gemini-3.8-flash-low")), Some("Gemini"));
+        assert_eq!(name(Some("claude-opus-5-5-high")), Some("Claude and GPT"));
+        assert_eq!(name(Some("gpt-oss-120b-medium")), Some("Claude and GPT"));
+        assert_eq!(name(None), Some("Claude and GPT"));
+        // After its reset time a limit is back to 0%.
+        let later = parse_ts("2026-11-24T22:30:00Z").unwrap();
+        assert_eq!(g.five_hour.unwrap().at(later).pct, 0.0);
+        assert!(parse_agy_quota("Error: not logged in", now).is_none());
     }
 
     #[test]

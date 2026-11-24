@@ -42,7 +42,7 @@ S_TERM_SCREENSHOT=target/shots/x.png S_TERM_DEMO=split,ai ./target/release/s-ter
 
 Steps, comma-separated: `ai` `changes` `files` `settings` `section=<name>` `palette` `commands` `ask` (a sample
 conversation waiting for approval) `asktyped=<text>` `setup` `setup=<n>` `split` `splitdown` `tab` `zoom`
-`theme=<id>` `folder=<dir>` `view=<file>` `launch` (the Launchpad view) `launchdemo` (load sample launchers)
+`theme=<id>` `folder=<dir>` `view=<file>` `wait=<s>` (shoot about s seconds later, e.g. for usage data) `launch` (the Launchpad view) `launchdemo` (load sample launchers)
 `launchnew` (the editor, filled in from the focused pane's folder) `launchrun` (run the sample ping; after
 `launchdemo`) `history` (the History view) `historydemo` (sample History entries) `restoreoffer` (the startup
 "reopen your last session?" popup). Open the PNG with the Read tool to check the result. `S_TERM_FONT="Family"`
@@ -105,6 +105,9 @@ or sends on a channel, then calls `ctx.request_repaint()`:
 - **Usage** (`usage.rs`, 3 s refresh): reads Claude Code's `~/.claude/projects/**.jsonl` incrementally (appended
   bytes only), Codex's `~/.codex/sessions`, and Antigravity's SQLite databases (read-only, protobuf blobs). It keeps
   its own `~/.local/share/s-term/usage-daily.json`. The data of other tools is read-only: never write to it.
+  Antigravity's plan quota isn't on disk: `AgyQuotaPoll` runs `agy -p /usage --output-format json` as a background
+  child (every minute while `agy` runs, every 10 minutes otherwise, only while Antigravity is on in Settings). Don't
+  read its login from the keyring instead.
   `usage_ui.rs` draws the AI view and the status-bar meter.
 - **Assistant**: see below.
 

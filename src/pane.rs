@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -65,6 +66,8 @@ pub struct Pane {
     /// Fractional wheel scroll not yet applied, in lines.
     pub scroll_accum: f32,
     pub cursor_anim: crate::render::CursorAnim,
+    /// `ai_tool`'s last answer and when it was read.
+    ai: Cell<(Option<std::time::Instant>, Option<&'static str>)>,
 }
 
 impl Pane {
@@ -112,6 +115,7 @@ impl Pane {
             child_pid,
             scroll_accum: 0.0,
             cursor_anim: Default::default(),
+            ai: Cell::new((None, None)),
         })
     }
 
@@ -153,6 +157,18 @@ impl Pane {
             }
             None => (comm(self.child_pid), true),
         }
+    }
+
+    /// The AI coding CLI in the foreground of this pane: `claude`, `codex` or `agy`. Tabs, pane headers
+    /// and the status meter ask every frame, so /proc is read at most every 500 ms.
+    pub fn ai_tool(&self) -> Option<&'static str> {
+        let (at, tool) = self.ai.get();
+        if at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500)) {
+            return tool;
+        }
+        let tool = self.foreground_pgid().and_then(ai_tool_of);
+        self.ai.set((Some(std::time::Instant::now()), tool));
+        tool
     }
 
     /// The process group in the foreground of the terminal when it isn't the shell's own: the
@@ -243,4 +259,29 @@ impl Drop for Pane {
         // Stops the IO thread; dropping the PTY there hangs up the shell.
         let _ = self.notifier.0.send(Msg::Shutdown);
     }
+}
+
+/// Which AI coding CLI process `pid` is: by its name, or for a script runner (an npm install runs
+/// `node …/@anthropic-ai/claude-code/cli.js` or `node …/@openai/codex/bin/codex.js`) by its script.
+fn ai_tool_of(pid: u32) -> Option<&'static str> {
+    const TOOLS: [&str; 3] = ["claude", "codex", "agy"];
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let comm = comm.trim_end();
+    if let Some(t) = TOOLS.iter().find(|t| **t == comm) {
+        return Some(t);
+    }
+    if !matches!(comm, "node" | "bun" | "deno") {
+        return None;
+    }
+    let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    cmd.split(|b| *b == 0).skip(1).take(3).find_map(|a| {
+        let a = String::from_utf8_lossy(a).to_ascii_lowercase();
+        if a.contains("claude-code") || a.ends_with("/claude") {
+            Some("claude")
+        } else if a.contains("@openai/codex") || a.ends_with("/codex") || a.ends_with("/codex.js") {
+            Some("codex")
+        } else {
+            None
+        }
+    })
 }

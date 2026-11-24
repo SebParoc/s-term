@@ -73,6 +73,12 @@ fn window_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, theme: &Theme, dange
 
 /// Tab label: the shell title without its `user@host:` prefix (`scorpius@fedora:~/s-term` → `~/s-term`).
 pub(super) fn tab_title(title: &str) -> &str {
+    // Claude Code starts its title with "✳ " while idle and a Braille spinner while it works; the
+    // tab and pane show its icon instead.
+    let title = match title.chars().next() {
+        Some(c) if c == '✳' || ('\u{2800}'..='\u{28FF}').contains(&c) => title[c.len_utf8()..].trim_start(),
+        _ => title,
+    };
     match title.split_once(':') {
         Some((who, rest)) if !rest.is_empty() && who.contains('@') && !who.contains(char::is_whitespace) => rest,
         _ => title,
@@ -89,6 +95,8 @@ mod tests {
         assert_eq!(tab_title("scorpius@fedora:~"), "~");
         assert_eq!(tab_title("vim: notes.md"), "vim: notes.md");
         assert_eq!(tab_title("claude"), "claude");
+        assert_eq!(tab_title("✳ Running the project"), "Running the project");
+        assert_eq!(tab_title("⠂ Running the project"), "Running the project");
         assert_eq!(tab_title("ssh me@box: uptime"), "ssh me@box: uptime");
     }
 }
@@ -308,7 +316,12 @@ impl STerm {
                     } else {
                         Icon::Terminal
                     };
-                    icons::draw(&p, icon, icons::center_rect(pos2(r.min.x + 18.0, r.center().y), 14.0), lerp_color(theme.muted, theme.pick_ink, on));
+                    // A single pane running Claude Code, Codex or Antigravity shows that tool's icon.
+                    let tool = (icon == Icon::Terminal).then(|| self.panes.get(&tab.focus)).flatten().and_then(|p| p.ai_tool());
+                    let (ic, at) = (lerp_color(theme.muted, theme.pick_ink, on), pos2(r.min.x + 18.0, r.center().y));
+                    if !tool.is_some_and(|t| usage_ui::tool_glyph(t, &p, at, 4.6, ic, on)) {
+                        icons::draw(&p, icon, icons::center_rect(at, 14.0), ic);
+                    }
                     let lit = hover.max(on);
                     let clip = p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - if lit > 0.05 { 28.0 } else { 10.0 }, r.max.y)));
                     let ink = lerp_color(lerp_color(theme.muted, theme.text, hover), theme.pick_ink, on);
@@ -474,6 +487,8 @@ impl STerm {
             }
             None => (0, false, None),
         };
+        // The AI CLI in the focused pane, so the meter follows the tool running there.
+        let fg = self.tab().and_then(|t| self.panes.get(&t.focus)).and_then(|p| p.ai_tool());
         egui::TopBottomPanel::bottom("s-term-status")
             .exact_height(STATUS_H)
             .show_separator_line(false)
@@ -521,7 +536,7 @@ impl STerm {
                             status_item(ui, theme, Some(Icon::Broadcast), "broadcasting", theme.accent2, Id::new("s-term-st-bc"));
                         }
                         if let Some(u) = &usage {
-                            if usage_ui::status_meter(ui, theme, u, &cfg, STATUS_H - 6.0).is_some_and(|r| r.clicked()) {
+                            if usage_ui::status_meter(ui, theme, u, &cfg, fg, STATUS_H - 6.0).is_some_and(|r| r.clicked()) {
                                 acts.push(Act::View(View::Ai));
                             }
                         }

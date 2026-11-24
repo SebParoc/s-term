@@ -252,7 +252,11 @@ impl STerm {
                 let hp = painter.with_clip_rect(header.shrink2(vec2(8.0, 0.0)));
                 let icon = if broadcast { Icon::Broadcast } else { Icon::Terminal };
                 let ic = lerp_color(theme.muted, theme.accent, t);
-                icons::draw(&hp, icon, icons::center_rect(pos2(header.min.x + 19.0, header.center().y), 16.0), ic);
+                // A pane running Claude Code, Codex or Antigravity shows that tool's icon.
+                let at = pos2(header.min.x + 19.0, header.center().y);
+                if !(!broadcast).then(|| pane.ai_tool()).flatten().is_some_and(|tool| crate::usage_ui::tool_glyph(tool, &hp, at, 5.0, ic, t)) {
+                    icons::draw(&hp, icon, icons::center_rect(at, 16.0), ic);
+                }
                 let title_color = lerp_color(lerp_color(theme.muted, theme.text, 0.55), theme.text, t);
                 // The path is what matters now that the prompt is short: `user@host:` is dimmed, the path is bright.
                 // Hierarchy: `user@host:` faint, parent path muted, folder name large and bright.

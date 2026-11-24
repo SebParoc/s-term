@@ -91,7 +91,8 @@ should talk to. Both are optional, and you can change them later in Settings.
 
 - **Title bar:** your tabs, **+** for a new tab, the **Ask S-term** box and the close button (minimize and maximize
   are optional). Drag a tab to reorder it and middle-click it to close it. A tab's icon shows when it has splits, when
-  it's broadcasting, and when a launcher runs in it (the tab then takes the launcher's name). Drag empty space to move
+  it's broadcasting, when a launcher runs in it (the tab then takes the launcher's name), and which AI CLI runs in its
+  pane: Claude Code, Codex or Antigravity. Drag empty space to move
   the window, and double-click it to maximize. Settings → Appearance → *System title bar* uses your desktop's title
   bar instead.
 - **Activity rail** (left edge): Explorer, Source control (with the number of changed files), Launchpad (a green dot
@@ -118,7 +119,8 @@ should talk to. Both are optional, and you can change them later in Settings.
   select* to copy as soon as you select.
 - `Shift+Enter` types a newline without submitting, in Claude Code and tools like it.
 
-Each pane can have a title bar showing what runs in it: always, only when the tab has splits, or never. Panes
+Each pane can have a title bar showing what runs in it, with the icon of Claude Code, Codex or Antigravity when one of
+them does: always, only when the tab has splits, or never. Panes
 without focus can be dimmed. Both are in Settings → Appearance.
 
 ## Ask S-term
@@ -233,19 +235,22 @@ Usage tracking is optional. During setup, S-term asks which AI coding tools you 
 and turns on the ones it finds. You can change them in Settings → AI tools. The AI view has four sections:
 
 - **Now:** each tool's live session, with a context ring that turns yellow at 50% and red at 75%
-- **Plan limits:** Claude Code's 5-hour and weekly limits, with reset countdowns
+- **Plan limits:** Claude Code's 5-hour and weekly limits, and Antigravity's for each of its model groups, with reset
+  countdowns
 - **Usage:** tokens per model across the tools you turned on, for the last 5 hours, today or the last 7 days, plus a
   24-hour output chart. Hover a model for its breakdown.
 - **Activity:** a calendar heatmap of daily tokens (output tokens or all tokens, see Settings → AI tools). Pick a
   model to see only that model, and hover a day for its details.
 
-The meter in the status bar shows the running tool's context and recent usage (for Claude Code, the 5-hour and weekly
-limits). Click it to open the AI view.
+The meter in the status bar follows the tool running in the focused pane (or, when that pane runs none, whichever is
+running: Claude Code, then Codex, then Antigravity). It shows the tool's context and its 5-hour and weekly limits: Claude
+Code's plan limits, Antigravity's for the model group of the conversation in use, and for Codex the tokens of the last
+5 hours and 7 days. Click it to open the AI view.
 
 Token counts come from Claude Code's transcripts in `~/.claude/projects`, Codex's session logs in `~/.codex/sessions`
 and Antigravity's conversation databases in `~/.gemini/antigravity-cli/conversations`, all read-only. S-term also
 keeps its own daily totals in `~/.local/share/s-term/usage-daily.json`, so your history outlives transcript cleanup.
-Usage tracking never sends anything off your machine.
+S-term itself never sends usage anywhere. The only request it causes is Antigravity's own quota check (see below).
 
 #### Claude Code plan limits
 
@@ -258,6 +263,14 @@ S-term read them, add this to `~/.claude/settings.json`:
 
 `s-term statusline` saves what Claude Code sends to `~/.cache/s-term/claude-status/` and prints a short line such as
 `Opus 5.5 · ctx 42% · 5h 38% · week 12%`. Settings → AI tools shows whether the hook is connected.
+
+#### Antigravity plan limits
+
+Antigravity keeps its quota on Google's servers, not on disk, so S-term runs the CLI's own report,
+`agy -p /usage --output-format json`, in the background: about once a minute while `agy` is running, and every 10
+minutes otherwise. It's the same check `/usage` does inside `agy`. It uses no quota, and `--log-file /dev/null` keeps
+it from leaving a log file each time. S-term never reads Antigravity's login. Turning Antigravity off in
+Settings → AI tools stops it.
 
 ## Command palette
 
@@ -351,8 +364,8 @@ S-term follows `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_CACHE_HOME` when they
 these folders.
 
 S-term reads Claude Code's, Codex's and Antigravity's own files (transcripts, session logs, conversation databases,
-`~/.claude/sessions`) without ever changing them. The only network traffic is the assistant's, and it goes only to
-the provider you picked.
+`~/.claude/sessions`) without ever changing them. The only network traffic is the assistant's, which goes only to
+the provider you picked, and Antigravity's own quota check when that tool is turned on ([details](#antigravity-plan-limits)).
 
 ## Command line
 

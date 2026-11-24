@@ -1321,12 +1321,18 @@ impl Sidebar {
         p.circle_stroke(ac, 11.0, egui::Stroke::new(1.0_f32, col.gamma_multiply(0.7)));
         p.text(ac, Align2::CENTER_CENTER, initials(&c.author), FontId::proportional(10.5), col);
         if let Some(agent) = c.agent() {
-            // Badge on the avatar's corner.
-            let bc = ac + vec2(8.5, 8.0);
-            p.circle_filled(bc, 6.0, theme.bar);
+            // Badge on the avatar's corner (Clawd is wider than tall).
             match agent {
-                Agent::Claude => crate::usage_ui::claude_icon(&p, bc, 4.6),
-                Agent::Gemini => crate::usage_ui::gemini_icon(&p, bc, 5.0),
+                Agent::Claude => {
+                    let bc = ac + vec2(10.0, 8.0);
+                    p.rect_filled(Rect::from_center_size(bc, vec2(20.0, 14.0)), 4.0, theme.bar);
+                    crate::usage_ui::claude_icon(&p, bc, 4.0);
+                }
+                Agent::Gemini => {
+                    let bc = ac + vec2(8.5, 8.0);
+                    p.circle_filled(bc, 6.0, theme.bar);
+                    crate::usage_ui::gemini_icon(&p, bc, 5.0);
+                }
             }
         }
 

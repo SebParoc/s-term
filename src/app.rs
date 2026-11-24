@@ -795,6 +795,7 @@ impl eframe::App for STerm {
             self.last_follow = Instant::now();
             let cwd = self.focused_cwd();
             self.sidebar.follow(cwd);
+            self.sidebar.usage.set_agy_quota(self.config.show_antigravity);
         }
 
         self.frame_resize(ctx);

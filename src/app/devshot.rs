@@ -11,6 +11,9 @@ pub struct DevShot {
     path: PathBuf,
     demo: Vec<String>,
     frame: u32,
+    /// The frame the screenshot is taken at: 90, plus about a second per `wait=<s>`, so background
+    /// data such as usage can arrive first.
+    shot_at: u32,
     requested: bool,
 }
 
@@ -18,7 +21,9 @@ impl DevShot {
     pub fn from_env() -> Option<Self> {
         let path = std::env::var_os("S_TERM_SCREENSHOT")?;
         let demo = std::env::var("S_TERM_DEMO").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-        Some(Self { path: path.into(), demo, frame: 0, requested: false })
+        let demo: Vec<String> = demo;
+        let shot_at = demo.iter().find_map(|s| s.strip_prefix("wait=")?.parse::<u32>().ok()).map_or(90, |s| 90 + s * 60);
+        Some(Self { path: path.into(), demo, frame: 0, shot_at, requested: false })
     }
 }
 
@@ -142,7 +147,7 @@ impl STerm {
                 }
             }
         }
-        if d.frame == 90 && !d.requested {
+        if d.frame == d.shot_at && !d.requested {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             d.requested = true;
         }

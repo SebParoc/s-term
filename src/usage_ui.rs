@@ -313,24 +313,99 @@ fn context_color(pct: f32, theme: &Theme) -> Color32 {
 
 // ------------------------------------------------------------------------------------------- icons
 
-/// Claude-style spark: rays of alternating length around a center.
-pub fn claude_icon(p: &Painter, c: Pos2, r: f32) {
-    let n = 12;
-    for i in 0..n {
-        let a = i as f32 / n as f32 * TAU + 0.13;
-        let len = if i % 2 == 0 { r } else { r * 0.72 };
-        let dir = vec2(a.cos(), a.sin());
-        p.line_segment([c + dir * r * 0.18, c + dir * len], Stroke::new(r * 0.24, CLAUDE_ORANGE));
+/// Clawd, Claude Code's mascot, as its banner draws him (quadrant blocks, so each row is doubled
+/// here to keep square pixels). `o` is an eye.
+const CLAWD: [&str; 10] = [
+    "..############..",
+    "..############..",
+    "..##o######o##..",
+    "..##o######o##..",
+    "################",
+    "################",
+    "..############..",
+    "..############..",
+    "...#.#....#.#...",
+    "...#.#....#.#...",
+];
+/// Claude Code's `clawd_body` color, and the black its eyes show through.
+const CLAWD_BODY: Color32 = Color32::from_rgb(215, 119, 87);
+const CLAWD_EYE: Color32 = Color32::from_rgb(20, 20, 20);
+
+/// The Antigravity CLI's logo, a 12×10 pixel "A", as (x, y, color) from its own banner.
+const AGY_LOGO: [(u8, u8, [u8; 3]); 50] = [
+    (5, 0, [242, 146, 46]), (6, 0, [240, 114, 54]), (4, 1, [219, 177, 49]), (5, 1, [246, 145, 46]), (6, 1, [243, 115, 55]), (7, 1, [240, 88, 59]),
+    (3, 2, [158, 195, 69]), (4, 2, [181, 180, 62]), (5, 2, [226, 153, 61]), (6, 2, [246, 122, 52]), (7, 2, [248, 106, 53]), (8, 2, [239, 84, 66]),
+    (3, 3, [134, 198, 78]), (4, 3, [117, 180, 94]), (5, 3, [204, 149, 77]), (6, 3, [239, 121, 71]), (7, 3, [225, 102, 82]), (8, 3, [225, 79, 89]),
+    (2, 4, [124, 194, 81]), (3, 4, [113, 194, 92]), (4, 4, [92, 169, 143]), (5, 4, [92, 145, 179]), (6, 4, [131, 115, 176]), (7, 4, [116, 111, 195]),
+    (8, 4, [153, 93, 168]), (9, 4, [156, 91, 151]), (2, 5, [128, 198, 84]), (3, 5, [84, 184, 129]), (4, 5, [64, 151, 222]), (7, 5, [74, 126, 228]),
+    (8, 5, [112, 110, 206]), (9, 5, [143, 100, 180]), (2, 6, [97, 195, 125]), (3, 6, [67, 174, 171]), (8, 6, [74, 128, 234]), (9, 6, [108, 115, 216]),
+    (1, 7, [109, 198, 148]), (2, 7, [98, 186, 213]), (3, 7, [71, 168, 220]), (8, 7, [61, 137, 251]), (9, 7, [74, 129, 240]), (10, 7, [101, 121, 225]),
+    (1, 8, [107, 199, 163]), (2, 8, [100, 182, 246]), (9, 8, [56, 134, 251]), (10, 8, [72, 129, 244]), (0, 9, [103, 185, 244]), (1, 9, [100, 182, 246]),
+    (10, 9, [56, 131, 249]), (11, 9, [61, 133, 252]),
+];
+
+/// Pixel art centered on `c`, about `height` tall. Pixels are whole physical pixels so it stays crisp.
+fn pixel_art(p: &Painter, c: Pos2, height: f32, (w, h): (usize, usize), px: impl Iterator<Item = (usize, usize, Color32)>) {
+    let ppp = p.ctx().pixels_per_point();
+    let s = (height / h as f32 * ppp).round().max(1.0) / ppp;
+    let snap = |v: f32| (v * ppp).round() / ppp;
+    let o = pos2(snap(c.x - w as f32 * s / 2.0), snap(c.y - h as f32 * s / 2.0));
+    for (x, y, col) in px {
+        p.rect_filled(Rect::from_min_size(o + vec2(x as f32 * s, y as f32 * s), vec2(s, s)), 0.0, col);
     }
-    p.circle_filled(c, r * 0.24, CLAUDE_ORANGE);
+}
+
+/// Clawd. He's wider than tall: about 3.5r × 2.2r.
+pub fn claude_icon(p: &Painter, c: Pos2, r: f32) {
+    clawd(p, c, r, Color32::TRANSPARENT, 1.0);
+}
+
+/// Clawd, blended from `tint` (eyes left open) at `vivid` 0 to his own colors at 1.
+fn clawd(p: &Painter, c: Pos2, r: f32, tint: Color32, vivid: f32) {
+    let px = CLAWD.iter().enumerate().flat_map(|(y, row)| {
+        row.bytes().enumerate().filter_map(move |(x, b)| match b {
+            b'#' => Some((x, y, lerp_color(tint, CLAWD_BODY, vivid))),
+            b'o' if vivid > 0.0 => Some((x, y, CLAWD_EYE.gamma_multiply(vivid))),
+            _ => None,
+        })
+    });
+    pixel_art(p, c, r * 2.2, (CLAWD[0].len(), CLAWD.len()), px);
+}
+
+/// An AI CLI's icon for the tab strip and pane title bars: in `tint`, like the icons around it, at
+/// `vivid` 0, and in its own colors at 1 (the selected tab, the focused pane). `tool` is its process
+/// name (`claude`, `codex`, `agy`); false when it isn't one of them.
+pub fn tool_glyph(tool: &str, p: &Painter, c: Pos2, r: f32, tint: Color32, vivid: f32) -> bool {
+    let vivid = vivid.clamp(0.0, 1.0);
+    match tool {
+        "claude" => clawd(p, c, r, tint, vivid),
+        "codex" => codex_glyph(p, c, r, lerp_color(tint, CODEX_TEAL, vivid)),
+        "agy" => agy_logo(p, c, r, tint, vivid),
+        _ => return false,
+    }
+    true
+}
+
+/// The Antigravity "A", about 2.6r × 2.2r.
+pub fn antigravity_icon(p: &Painter, c: Pos2, r: f32) {
+    agy_logo(p, c, r, Color32::TRANSPARENT, 1.0);
+}
+
+fn agy_logo(p: &Painter, c: Pos2, r: f32, tint: Color32, vivid: f32) {
+    let px = AGY_LOGO.iter().map(|&(x, y, [r, g, b])| (x as usize, y as usize, lerp_color(tint, Color32::from_rgb(r, g, b), vivid)));
+    pixel_art(p, c, r * 2.2, (12, 10), px);
 }
 
 /// A rounded terminal window with a `>_` prompt.
 pub fn codex_icon(p: &Painter, c: Pos2, r: f32) {
+    codex_glyph(p, c, r, CODEX_TEAL);
+}
+
+fn codex_glyph(p: &Painter, c: Pos2, r: f32, color: Color32) {
     let rect = Rect::from_center_size(c, vec2(r * 2.0, r * 1.7));
     let w = (r * 0.2).max(1.0);
-    p.rect_stroke(rect, r * 0.35, Stroke::new(w, CODEX_TEAL));
-    let s = Stroke::new(w, CODEX_TEAL);
+    p.rect_stroke(rect, r * 0.35, Stroke::new(w, color));
+    let s = Stroke::new(w, color);
     let a = pos2(c.x - r * 0.55, c.y - r * 0.35);
     p.line_segment([a, pos2(c.x - r * 0.15, c.y)], s);
     p.line_segment([pos2(c.x - r * 0.15, c.y), pos2(c.x - r * 0.55, c.y + r * 0.35)], s);
@@ -435,7 +510,8 @@ fn pct_of(live: &Live) -> Option<f32> {
     live.context_pct.or_else(|| live.context_size.map(|s| live.context_tokens as f32 / s as f32 * 100.0))
 }
 
-/// A live session: a context ring, the session name with its tool's icon, and one line of detail.
+/// A live session: the tool's icon in a ring that fills with the context (when its size is known),
+/// the session name, and one line of detail.
 #[allow(clippy::too_many_arguments)]
 fn live_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), live: &Live, now: i64, working: bool, accent: Color32) {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
@@ -443,15 +519,10 @@ fn live_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), liv
     let c = pos2(r.min.x + 18.0, r.center().y);
     let pct = pct_of(live);
     match pct {
-        Some(v) => {
-            ring(p, c, 15.0, v / 100.0, context_color(v, theme), theme.header, 3.0);
-            p.text(c, Align2::CENTER_CENTER, format!("{v:.0}"), FontId::proportional(10.5), theme.text);
-        }
-        None => {
-            ring(p, c, 15.0, 0.0, accent, theme.header, 3.0);
-            icon(p, c, 6.0);
-        }
+        Some(v) => ring(p, c, 15.0, v / 100.0, context_color(v, theme), theme.header, 3.0),
+        None => ring(p, c, 15.0, 0.0, accent, theme.header, 3.0),
     }
+    icon(p, c, 6.0);
     let x = r.min.x + 44.0;
     // Status on the right: a pulsing dot while the agent works.
     let dot = if working {
@@ -463,14 +534,7 @@ fn live_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), liv
     };
     p.circle_filled(pos2(r.max.x - 4.0, r.min.y + 12.0), 3.0, dot);
     let clip = p.with_clip_rect(Rect::from_min_max(pos2(x, r.min.y), pos2(r.max.x - 14.0, r.max.y)));
-    // The tool's icon sits in the ring when there's no percentage; otherwise it leads the name.
-    let tx = if pct.is_some() {
-        icon(&clip, pos2(x + 5.0, r.min.y + 12.0), 4.5);
-        x + 15.0
-    } else {
-        x
-    };
-    clip.text(pos2(tx, r.min.y + 12.0), Align2::LEFT_CENTER, &live.label, FontId::proportional(12.5), theme.text);
+    clip.text(pos2(x, r.min.y + 12.0), Align2::LEFT_CENTER, &live.label, FontId::proportional(12.5), theme.text);
     let mut ctx_s = tokens(live.context_tokens);
     if let Some(sz) = live.context_size {
         ctx_s.push_str(&format!(" / {}", tokens(sz)));
@@ -510,6 +574,17 @@ fn limit_row(ui: &mut egui::Ui, theme: &Theme, label: &str, l: &Limit, now: i64)
         p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, format!("resets in {}", duration(t - now)), FontId::proportional(10.5), theme.muted);
     }
     thin_bar(p, Rect::from_min_max(pos2(r.min.x, r.max.y - 6.0), pos2(r.max.x, r.max.y - 2.0)), l.pct / 100.0, color, theme);
+}
+
+/// A tool's icon and name over its plan-limit rows, and when they were read.
+fn limits_head(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, updated: Option<i64>, now: i64) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
+    let p = ui.painter();
+    icon(p, pos2(r.min.x + 8.0, r.center().y), 4.6);
+    p.text(pos2(r.min.x + 19.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(11.5), theme.text);
+    if let Some(t) = updated {
+        p.text(pos2(r.max.x, r.center().y), Align2::RIGHT_CENTER, format!("updated {}", ago(now, t)), FontId::proportional(10.0), theme.muted.gamma_multiply(0.8));
+    }
 }
 
 /// A model: dot, name, total, and a thin bar relative to the busiest model. Hover for the breakdown.
@@ -622,7 +697,7 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
     let tools: Vec<(&ToolStats, &str, fn(&Painter, Pos2, f32), Color32)> = [
         (claude, &s.claude, "Claude Code", claude_icon as fn(&Painter, Pos2, f32), CLAUDE_ORANGE),
         (codex, &s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL),
-        (agy, &s.agy, "Antigravity", gemini_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE),
+        (agy, &s.agy, "Antigravity", antigravity_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE),
     ]
     .into_iter()
     .filter(|t| t.0)
@@ -640,29 +715,58 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
         ui.add_space(2.0);
     }
 
-    // ---- plan limits
+    // ---- plan limits: Claude Code's from its status line, Antigravity's from `agy -p /usage`.
+    // With both, each tool gets a heading row that says when its limits were read.
+    let quota = s.agy_quota.as_deref().filter(|q| agy && !q.groups.is_empty());
+    let claude_lim = s.limits.as_ref().filter(|l| l.five_hour.is_some() || l.seven_day.is_some());
+    let both = claude && quota.is_some();
+    if claude || quota.is_some() {
+        let updated = if both { None } else if claude { claude_lim.map(|l| l.updated) } else { quota.map(|q| q.updated) };
+        section(ui, theme, "PLAN LIMITS", |ui| {
+            if let Some(t) = updated {
+                ui.label(RichText::new(format!("updated {}", ago(s.now, t))).size(10.0).color(theme.muted.gamma_multiply(0.8)));
+            }
+        });
+    }
     if claude {
-        match &s.limits {
-            Some(l) if l.five_hour.is_some() || l.seven_day.is_some() => {
-                section(ui, theme, "PLAN LIMITS", |ui| {
-                    ui.label(RichText::new(format!("updated {}", ago(s.now, l.updated))).size(10.0).color(theme.muted.gamma_multiply(0.8)));
-                });
-                if let Some(w) = &l.five_hour {
-                    limit_row(ui, theme, "5-hour", w, s.now);
+        if both {
+            limits_head(ui, theme, claude_icon, "Claude Code", claude_lim.map(|l| l.updated), s.now);
+        }
+        match claude_lim {
+            Some(l) => {
+                // A window whose reset time has passed reads 0% until Claude Code reports again.
+                if let Some(w) = l.five_hour {
+                    limit_row(ui, theme, "5-hour", &w.at(s.now), s.now);
                 }
-                if let Some(w) = &l.seven_day {
+                if let Some(w) = l.seven_day {
                     ui.add_space(4.0);
-                    limit_row(ui, theme, "Weekly", w, s.now);
+                    limit_row(ui, theme, "Weekly", &w.at(s.now), s.now);
                 }
             }
-            _ => {
-                section(ui, theme, "PLAN LIMITS", |_| {});
+            None => {
                 let msg = if s.statusline_seen {
                     "Plan limits appear after Claude Code's next reply."
                 } else {
                     "Set Claude Code's statusLine to `s-term statusline` to see your 5-hour and weekly limits (see README)."
                 };
                 ui.label(RichText::new(msg).size(11.0).color(theme.muted));
+            }
+        }
+    }
+    if let Some(q) = quota {
+        if both {
+            ui.add_space(8.0);
+            limits_head(ui, theme, antigravity_icon, "Antigravity", Some(q.updated), s.now);
+        }
+        let mut first = true;
+        for g in &q.groups {
+            for (w, l) in [("5-hour", g.five_hour), ("Weekly", g.weekly)] {
+                let Some(l) = l else { continue };
+                if !first {
+                    ui.add_space(4.0);
+                }
+                first = false;
+                limit_row(ui, theme, &format!("{} · {w}", g.short_name()), &l.at(s.now), s.now);
             }
         }
     }
@@ -710,23 +814,25 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
     ui.add_space(12.0);
 }
 
-/// Status-bar meter for whichever AI CLI is running: Claude Code (this pane's context, the 5-hour and
-/// weekly plan limits), else Codex or Antigravity (context and recent token use). Only tools turned
-/// on in Settings count. Hidden when none is running.
-pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config, height: f32) -> Option<egui::Response> {
+/// Status-bar meter for one AI CLI: the one in the focused pane (`fg` is its foreground program),
+/// else whichever is running, Claude Code first, then Codex, then Antigravity. Claude Code shows this
+/// pane's context and the 5-hour and weekly plan limits; Antigravity its context and the limits of the
+/// live model's group (token use until its quota has been read); Codex its context and recent token
+/// use. Only tools turned on in Settings count. Hidden when none is running.
+pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config, fg: Option<&str>, height: f32) -> Option<egui::Response> {
     // (label, value text, bar fill %, color)
     let mut segs: Vec<(&str, String, Option<f32>, Color32)> = Vec::new();
     let mut tip: Vec<String> = Vec::new();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let icon: fn(&Painter, Pos2, f32);
-    let other = if s.codex.running && cfg.show_codex {
-        Some((&s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL))
-    } else if s.agy.running && cfg.show_antigravity {
-        Some((&s.agy, "Antigravity", gemini_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE))
-    } else {
-        None
+    let pick = meter_tool(fg, [(s.claude.running, cfg.show_claude), (s.codex.running, cfg.show_codex), (s.agy.running, cfg.show_antigravity)]);
+    let resets = |l: &Limit| l.resets_at.filter(|t| *t > now).map_or(String::new(), |t| format!("  ·  resets in {}", duration(t - now)));
+    let other = match pick {
+        Some("codex") => Some((&s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL)),
+        Some("agy") => Some((&s.agy, "Antigravity", antigravity_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE)),
+        _ => None,
     };
-    if s.claude.running && cfg.show_claude {
+    if pick == Some("claude") {
         icon = claude_icon;
         if let Some(l) = s.claude.live.as_ref().filter(|l| l.here) {
             let pct = l.context_pct.or_else(|| l.context_size.map(|sz| l.context_tokens as f32 / sz as f32 * 100.0));
@@ -742,12 +848,11 @@ pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config
             }
         }
         let lim = s.limits.as_ref();
-        let resets = |l: &Limit| l.resets_at.filter(|t| *t > now).map_or(String::new(), |t| format!("  ·  resets in {}", duration(t - now)));
-        if let Some(f) = lim.and_then(|l| l.five_hour) {
+        if let Some(f) = lim.and_then(|l| l.five_hour).map(|l| l.at(now)) {
             segs.push(("5h", format!("{:.0}%", f.pct), Some(f.pct), level_color(f.pct, theme)));
             tip.push(format!("5-hour limit: {:.0}% used{}", f.pct, resets(&f)));
         }
-        if let Some(w) = lim.and_then(|l| l.seven_day) {
+        if let Some(w) = lim.and_then(|l| l.seven_day).map(|l| l.at(now)) {
             segs.push(("Week", format!("{:.0}%", w.pct), Some(w.pct), level_color(w.pct, theme)));
             tip.push(format!("Weekly limit: {:.0}% used{}", w.pct, resets(&w)));
         }
@@ -765,11 +870,21 @@ pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config
                 }
             }
         }
-        let sum = |w: Window| st.windows.get(&w).map_or(0, |v| v.iter().map(|m| m.total()).sum::<u64>());
-        let (h5, wk) = (sum(Window::FiveHours), sum(Window::Week));
-        segs.push(("5h", tokens(h5), None, color));
-        segs.push(("Week", tokens(wk), None, color));
-        tip.push(format!("{name} tokens: {} in the last 5 hours  ·  {} in the last 7 days", tokens(h5), tokens(wk)));
+        let group = s.agy_quota.as_ref().filter(|_| pick == Some("agy")).and_then(|q| q.group_for(st.live.as_ref().map(|l| &*l.model), now));
+        if let Some(g) = group {
+            for (label, long, lim) in [("5h", "5-hour", g.five_hour), ("Week", "Weekly", g.weekly)] {
+                if let Some(l) = lim.map(|l| l.at(now)) {
+                    segs.push((label, format!("{:.0}%", l.pct), Some(l.pct), level_color(l.pct, theme)));
+                    tip.push(format!("{} · {long} limit: {:.0}% used{}", g.name, l.pct, resets(&l)));
+                }
+            }
+        } else {
+            let sum = |w: Window| st.windows.get(&w).map_or(0, |v| v.iter().map(|m| m.total()).sum::<u64>());
+            let (h5, wk) = (sum(Window::FiveHours), sum(Window::Week));
+            segs.push(("5h", tokens(h5), None, color));
+            segs.push(("Week", tokens(wk), None, color));
+            tip.push(format!("{name} tokens: {} in the last 5 hours  ·  {} in the last 7 days", tokens(h5), tokens(wk)));
+        }
     } else {
         return None;
     }
@@ -791,12 +906,12 @@ pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config
         })
         .collect();
     let content: f32 = laid.iter().zip(&segs).map(|((n, v), seg)| n.size().x + GAP + if seg.2.is_some() { BAR_W + GAP } else { 0.0 } + v.size().x).sum::<f32>() + SEP * (laid.len() - 1) as f32;
-    let (r, resp) = ui.allocate_exact_size(vec2(22.0 + content + 10.0, height), CLICK);
+    let (r, resp) = ui.allocate_exact_size(vec2(25.0 + content + 10.0, height), CLICK);
     let hover = ui.ctx().animate_bool_with_time(ui.id().with("s-term-status-meter"), resp.hovered(), 0.1);
     let p = ui.painter();
     p.rect_filled(r, r.height() / 2.0, lerp_color(theme.header.gamma_multiply(0.6), theme.header, hover));
-    icon(p, pos2(r.min.x + 12.0, r.center().y), 4.6);
-    let mut x = r.min.x + 22.0;
+    icon(p, pos2(r.min.x + 13.0, r.center().y), 4.6);
+    let mut x = r.min.x + 25.0;
     let cy = r.center().y;
     for (i, ((n, v), (_, _, pct, col))) in laid.into_iter().zip(&segs).enumerate() {
         if i > 0 {
@@ -820,4 +935,30 @@ pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config
     }
     tip.push("Click to open AI usage".into());
     Some(resp.on_hover_text(tip.join("\n")))
+}
+
+/// Which tool the status meter follows (`claude`, `codex` or `agy`). `tools` is (running, turned on)
+/// for each, in that order. The focused pane's program wins over a tool running elsewhere.
+fn meter_tool(fg: Option<&str>, tools: [(bool, bool); 3]) -> Option<&'static str> {
+    const NAMES: [&str; 3] = ["claude", "codex", "agy"];
+    NAMES.iter().zip(tools).find(|(n, (_, on))| *on && fg == Some(**n)).or_else(|| NAMES.iter().zip(tools).find(|(_, (run, on))| *run && *on)).map(|(n, _)| *n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meter_tool;
+
+    #[test]
+    fn meter_follows_focused_pane() {
+        let all = [(true, true); 3];
+        // Claude runs elsewhere, but the focused pane runs agy.
+        assert_eq!(meter_tool(Some("agy"), all), Some("agy"));
+        assert_eq!(meter_tool(Some("codex"), all), Some("codex"));
+        // A shell or another program in the focused pane: Claude, then Codex, then Antigravity.
+        assert_eq!(meter_tool(Some("vim"), all), Some("claude"));
+        assert_eq!(meter_tool(None, [(false, true), (false, true), (true, true)]), Some("agy"));
+        // A tool turned off in Settings is never shown, even in the focused pane.
+        assert_eq!(meter_tool(Some("agy"), [(true, true), (false, true), (true, false)]), Some("claude"));
+        assert_eq!(meter_tool(None, [(false, true); 3]), None);
+    }
 }
