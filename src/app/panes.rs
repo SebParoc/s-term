@@ -1,6 +1,6 @@
 //! Terminal panes: animated layout, mouse handling and painting.
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions as _, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
@@ -25,6 +25,8 @@ const PANE_BORDER: f32 = 0.6;
 /// Exponential smoothing rates (1/s): higher = snappier.
 const LAYOUT_SPEED: f32 = 16.0;
 const CURSOR_SPEED: f32 = 38.0;
+/// The cursor's trailing edge, slower than the head so moves leave a short smear.
+const CURSOR_TAIL_SPEED: f32 = 18.0;
 const TAB_FADE_SECS: f32 = 0.15;
 
 fn grid_point(pos: Pos2, origin: Pos2, cell: Vec2, size: GridSize, offset: usize) -> (Point, Side) {
@@ -55,7 +57,12 @@ impl STerm {
 
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 1.0 / 30.0);
         let k = if anim { 1.0 - (-dt * LAYOUT_SPEED).exp() } else { 1.0 };
-        let cursor_k = if self.config.cursor_glide && anim { 1.0 - (-dt * CURSOR_SPEED).exp() } else { 1.0 };
+        let glide = self.config.cursor_glide && anim;
+        let cursor_k = if glide { 1.0 - (-dt * CURSOR_SPEED).exp() } else { 1.0 };
+        let cursor_tail_k = if glide { 1.0 - (-dt * CURSOR_TAIL_SPEED).exp() } else { 1.0 };
+        let time = ctx.input(|i| i.time);
+        let blink = self.config.cursor_blink && ctx.input(|i| i.focused);
+        let mut next_frame = f32::INFINITY;
 
         let mut targets = Vec::new();
         let mut dividers: Vec<Divider> = Vec::new();
@@ -105,6 +112,11 @@ impl STerm {
         // A file is being dragged from the side panel (or the desktop): highlight the pane under the pointer.
         let os_drag = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let drop_pos = if self.sidebar.dragging().is_some() || os_drag { ctx.pointer_latest_pos() } else { None };
+        // A single folder dropped on a pane at an empty shell prompt cds there (see `drop_paths`).
+        let drag_dir = match self.sidebar.dragging() {
+            Some(p) => p.is_dir(),
+            None => ctx.input(|i| matches!(&i.raw.hovered_files[..], [f] if f.path.as_ref().is_some_and(|p| p.is_dir()))),
+        };
         let theme = &self.theme;
         let cell = self.cell;
         let painter = ui.painter().clone();
@@ -173,7 +185,7 @@ impl STerm {
                 if self.config.copy_on_select && (resp.drag_stopped() || resp.double_clicked() || resp.triple_clicked()) {
                     copy_text = term.selection_to_string().filter(|s| !s.is_empty());
                 }
-                if resp.hovered() && scroll_y != 0.0 {
+                if resp.contains_pointer() && scroll_y != 0.0 {
                     pane.scroll_accum += scroll_y / cell.y;
                     let lines = pane.scroll_accum.trunc() as i32;
                     pane.scroll_accum -= lines as f32;
@@ -181,7 +193,19 @@ impl STerm {
                         let mode = *term.mode();
                         let mods = ui.input(|i| i.modifiers);
                         let count = lines.unsigned_abs() as usize;
-                        if mode.intersects(TermMode::MOUSE_MODE) && !mods.shift {
+                        // Mid-selection the wheel always scrolls our own scrollback: forwarding it
+                        // makes the app redraw, which wipes the selection being made.
+                        let selecting = resp.dragged() && term.selection.is_some();
+                        if selecting {
+                            term.scroll_display(Scroll::Delta(lines));
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let off = term.grid().display_offset();
+                                let (pt, side) = grid_point(pos, origin, cell, size, off);
+                                if let Some(sel) = term.selection.as_mut() {
+                                    sel.update(pt, side);
+                                }
+                            }
+                        } else if mode.intersects(TermMode::MOUSE_MODE) && !mods.shift {
                             // App asked for mouse events (Claude Code, vim, htop...): send real
                             // wheel events so it scrolls its own view. Shift+wheel bypasses this.
                             let pos = resp.hover_pos().unwrap_or(origin);
@@ -261,8 +285,8 @@ impl STerm {
             }
 
             let tp = painter.with_clip_rect(body.shrink(1.0));
-            let frame = render::Frame { painter: &tp, origin, theme, cell, focused, faux_bold: self.faux_bold, cursor_k, cursor_shape };
-            animating |= render::paint_terminal(&frame, &term, &mut self.glyphs, &mut pane.cursor_anim);
+            let frame = render::Frame { painter: &tp, origin, theme, cell, focused, faux_bold: self.faux_bold, cursor_k, cursor_tail_k, cursor_shape, time, blink };
+            next_frame = next_frame.min(render::paint_terminal(&frame, &term, &mut self.glyphs, &mut pane.cursor_anim));
             drop(term);
 
             if multi {
@@ -277,11 +301,66 @@ impl STerm {
             }
             crate::glass::paint_rim(&painter, r, ROUND, theme, 0.45 + 0.35 * t);
 
-            let drop_t = ctx.animate_bool_with_time(Id::new(("s-term-drop", id)), drop_pos.is_some_and(|p| r.contains(p)), 0.12);
+            // ---- scrollbar: a thin floating handle over the right padding, like the side panel's.
+            {
+                let mut term = pane.term.lock();
+                let history = term.grid().history_size();
+                let alt = term.mode().contains(TermMode::ALT_SCREEN);
+                let offset = term.grid().display_offset();
+                let track = Rect::from_min_max(pos2(body.max.x - 9.0, inner.min.y), pos2(body.max.x - 1.0, inner.max.y));
+                let bar_id = Id::new(("s-term-pane-bar", id));
+                if history > 0 && !alt && track.height() > 20.0 {
+                    let bar = ui.interact(track, bar_id, CLICK_DRAG);
+                    let total = (history + size.rows) as f32;
+                    let handle_h = (track.height() * size.rows as f32 / total).max(24.0).min(track.height());
+                    let travel = track.height() - handle_h;
+                    let top_frac = (history - offset) as f32 / history as f32;
+                    let handle_y = track.min.y + travel * top_frac;
+                    let set_top = |term: &mut alacritty_terminal::Term<_>, top: f32| {
+                        let frac = if travel > 0.0 { ((top - track.min.y) / travel).clamp(0.0, 1.0) } else { 1.0 };
+                        let want = history - (frac * history as f32).round() as usize;
+                        let now = term.grid().display_offset();
+                        term.scroll_display(Scroll::Delta(want as i32 - now as i32));
+                    };
+                    let grab_id = bar_id.with("grab");
+                    if bar.drag_started() {
+                        if let Some(p) = bar.interact_pointer_pos() {
+                            // Grab the handle where it was pressed; pressing the track jumps the handle there.
+                            let grab = if (handle_y..handle_y + handle_h).contains(&p.y) { p.y - handle_y } else { handle_h / 2.0 };
+                            ctx.data_mut(|d| d.insert_temp(grab_id, grab));
+                        }
+                    }
+                    if let Some(p) = bar.interact_pointer_pos() {
+                        if bar.dragged() || bar.clicked() {
+                            let grab = if bar.dragged() { ctx.data(|d| d.get_temp(grab_id)).unwrap_or(handle_h / 2.0) } else { handle_h / 2.0 };
+                            set_top(&mut term, p.y - grab);
+                            new_focus = Some(id);
+                        }
+                    }
+                    let offset = term.grid().display_offset();
+                    let handle_y = track.min.y + travel * (history - offset) as f32 / history as f32;
+                    let hot = bar.hovered() || bar.dragged();
+                    let show = ctx.animate_bool_with_time(bar_id.with("show"), hot || resp.hovered() || offset > 0, 0.2);
+                    let wide = ctx.animate_bool_with_time(bar_id.with("wide"), hot, 0.12);
+                    if show > 0.01 {
+                        let w = 3.0 + 3.0 * wide;
+                        let handle = Rect::from_min_max(pos2(track.max.x - 2.0 - w, handle_y), pos2(track.max.x - 2.0, handle_y + handle_h));
+                        let color = theme.muted.gamma_multiply((0.35 + 0.4 * wide) * show);
+                        painter.rect_filled(handle, w / 2.0, color);
+                    }
+                    if hot {
+                        ctx.set_cursor_icon(CursorIcon::Default);
+                    }
+                }
+            }
+
+            let over = drop_pos.is_some_and(|p| r.contains(p));
+            let drop_t = ctx.animate_bool_with_time(Id::new(("s-term-drop", id)), over, 0.12);
             if drop_t > 0.01 {
+                let label = if drag_dir && pane.at_empty_prompt() { "Drop to cd here" } else { "Drop to insert path" };
                 painter.rect_filled(r, ROUND, theme.accent.gamma_multiply(0.08 * drop_t));
                 painter.rect_stroke(r.shrink(1.0), ROUND, Stroke::new(2.0_f32, theme.accent.gamma_multiply(drop_t)));
-                let g = painter.layout_no_wrap("Drop to insert path".into(), FontId::proportional(13.0), theme.text);
+                let g = painter.layout_no_wrap(label.into(), FontId::proportional(13.0), theme.text);
                 let br = Rect::from_center_size(pos2(r.center().x, r.max.y - 28.0), g.size() + vec2(20.0, 10.0));
                 painter.rect_filled(br, 8.0, theme.elevated.gamma_multiply(drop_t));
                 painter.galley(br.min + vec2(10.0, 5.0), g, theme.text.gamma_multiply(drop_t));
@@ -339,8 +418,10 @@ impl STerm {
             tab.focus = f;
         }
         self.rects = targets;
-        if animating {
+        if animating || next_frame <= 0.0 {
             ctx.request_repaint();
+        } else if next_frame.is_finite() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32(next_frame));
         }
     }
 }

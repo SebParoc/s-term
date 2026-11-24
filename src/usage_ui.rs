@@ -14,6 +14,7 @@ pub const CLAUDE_ORANGE: Color32 = Color32::from_rgb(0xd9, 0x77, 0x57);
 const GEMINI_BLUE: Color32 = Color32::from_rgb(0x42, 0x85, 0xf4);
 const GEMINI_PURPLE: Color32 = Color32::from_rgb(0x9b, 0x72, 0xcb);
 const GEMINI_PINK: Color32 = Color32::from_rgb(0xd9, 0x65, 0x70);
+pub const CODEX_TEAL: Color32 = Color32::from_rgb(0x3e, 0xc6, 0xa8);
 
 pub struct UsageUi {
     window: Window,
@@ -260,6 +261,13 @@ pub fn model_name(id: &str) -> String {
         }
         return s;
     }
+    if let Some(rest) = id.strip_prefix("gpt-") {
+        // gpt-5.1-codex-mini -> GPT-5.1 Codex Mini
+        let mut parts = rest.split('-');
+        let ver = parts.next().unwrap_or("");
+        let words: Vec<String> = parts.map(|w| format!("{}{}", w[..1.min(w.len())].to_uppercase(), w.get(1..).unwrap_or(""))).collect();
+        return format!("GPT-{ver} {}", words.join(" ")).trim().to_string();
+    }
     id.to_string()
 }
 
@@ -273,6 +281,8 @@ pub fn model_color(id: &str, theme: &Theme) -> Color32 {
         c32(theme.palette[2])
     } else if l.contains("fable") {
         c32(theme.palette[3])
+    } else if l.starts_with("gpt") || l.contains("codex") {
+        CODEX_TEAL
     } else if l.contains("gemini") {
         let h = l.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
         [GEMINI_BLUE, GEMINI_PURPLE, c32(theme.palette[6]), GEMINI_PINK][(h % 4) as usize]
@@ -313,6 +323,18 @@ pub fn claude_icon(p: &Painter, c: Pos2, r: f32) {
         p.line_segment([c + dir * r * 0.18, c + dir * len], Stroke::new(r * 0.24, CLAUDE_ORANGE));
     }
     p.circle_filled(c, r * 0.24, CLAUDE_ORANGE);
+}
+
+/// A rounded terminal window with a `>_` prompt.
+pub fn codex_icon(p: &Painter, c: Pos2, r: f32) {
+    let rect = Rect::from_center_size(c, vec2(r * 2.0, r * 1.7));
+    let w = (r * 0.2).max(1.0);
+    p.rect_stroke(rect, r * 0.35, Stroke::new(w, CODEX_TEAL));
+    let s = Stroke::new(w, CODEX_TEAL);
+    let a = pos2(c.x - r * 0.55, c.y - r * 0.35);
+    p.line_segment([a, pos2(c.x - r * 0.15, c.y)], s);
+    p.line_segment([pos2(c.x - r * 0.15, c.y), pos2(c.x - r * 0.55, c.y + r * 0.35)], s);
+    p.line_segment([pos2(c.x + r * 0.05, c.y + r * 0.4), pos2(c.x + r * 0.55, c.y + r * 0.4)], s);
 }
 
 /// Four-point sparkle with a blue → purple → pink gradient.
@@ -536,7 +558,11 @@ fn sparkline(ui: &mut egui::Ui, theme: &Theme, hourly: &[u64; 24], color: Color3
     if let Some(i) = hover {
         let hours_ago = 23 - i as i64;
         let when = if hours_ago == 0 { "this hour".to_string() } else { format!("{hours_ago}h ago") };
-        resp.on_hover_text(format!("{when}: {} output tokens", tokens(hourly[i])));
+        // One widget spans all 24 bars, so anchor the tooltip to the hovered column, not the widget's left edge.
+        let col = Rect::from_min_max(pos2(r.min.x + i as f32 * w, r.min.y), pos2(r.min.x + (i + 1) as f32 * w, r.max.y));
+        egui::show_tooltip_for(ui.ctx(), ui.layer_id(), resp.id.with(i), &col, |ui| {
+            ui.label(format!("{when}: {} output tokens", tokens(hourly[i])));
+        });
     }
 }
 
@@ -549,7 +575,7 @@ fn window_picker(ui: &mut egui::Ui, theme: &Theme, state: &mut UsageUi) {
     let order = [2usize, 1, 0]; // show 5h · Today · 7d left to right
     let slot = |i: usize| Rect::from_min_size(pos2(rect.min.x + w * order[i] as f32, rect.min.y), vec2(w, rect.height()));
     if let Some(i) = opts.iter().position(|(win, _)| state.window == *win) {
-        let shown = crate::glass::slide(ui.ctx(), Id::new("s-term-usage-win-pick"), slot(i), true);
+        let shown = crate::glass::slide_within(ui.ctx(), Id::new("s-term-usage-win-pick"), slot(i), rect.min, true);
         crate::glass::pick(ui.painter(), shown, theme);
     }
     for (i, (win, label)) in opts.iter().enumerate() {
@@ -582,13 +608,20 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
     };
     let claude = s.claude.installed && cfg.show_claude;
     let agy = s.agy.installed && cfg.show_antigravity;
-    if !claude && !agy {
+    let codex = s.codex.installed && cfg.show_codex;
+    if !claude && !agy && !codex {
         ui.add_space(8.0);
-        ui.label(RichText::new("No Claude Code or Antigravity CLI data found.").color(theme.muted));
+        let msg = if cfg.show_claude || cfg.show_antigravity || cfg.show_codex {
+            "No usage data found for the AI tools turned on in Settings → AI tools."
+        } else {
+            "No AI tools are turned on. Pick the ones you use in Settings → AI tools."
+        };
+        ui.label(RichText::new(msg).color(theme.muted));
         return;
     }
     let tools: Vec<(&ToolStats, &str, fn(&Painter, Pos2, f32), Color32)> = [
         (claude, &s.claude, "Claude Code", claude_icon as fn(&Painter, Pos2, f32), CLAUDE_ORANGE),
+        (codex, &s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL),
         (agy, &s.agy, "Antigravity", gemini_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE),
     ]
     .into_iter()
@@ -678,15 +711,22 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
 }
 
 /// Status-bar meter for whichever AI CLI is running: Claude Code (this pane's context, the 5-hour and
-/// weekly plan limits) or, when only it is running, Antigravity (context and recent token use).
-/// Hidden when neither is running.
-pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, show_agy: bool, height: f32) -> Option<egui::Response> {
+/// weekly plan limits), else Codex or Antigravity (context and recent token use). Only tools turned
+/// on in Settings count. Hidden when none is running.
+pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, cfg: &Config, height: f32) -> Option<egui::Response> {
     // (label, value text, bar fill %, color)
     let mut segs: Vec<(&str, String, Option<f32>, Color32)> = Vec::new();
     let mut tip: Vec<String> = Vec::new();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
     let icon: fn(&Painter, Pos2, f32);
-    if s.claude.running {
+    let other = if s.codex.running && cfg.show_codex {
+        Some((&s.codex, "Codex", codex_icon as fn(&Painter, Pos2, f32), CODEX_TEAL))
+    } else if s.agy.running && cfg.show_antigravity {
+        Some((&s.agy, "Antigravity", gemini_icon as fn(&Painter, Pos2, f32), GEMINI_BLUE))
+    } else {
+        None
+    };
+    if s.claude.running && cfg.show_claude {
         icon = claude_icon;
         if let Some(l) = s.claude.live.as_ref().filter(|l| l.here) {
             let pct = l.context_pct.or_else(|| l.context_size.map(|sz| l.context_tokens as f32 / sz as f32 * 100.0));
@@ -711,17 +751,25 @@ pub fn status_meter(ui: &mut egui::Ui, theme: &Theme, s: &Snapshot, show_agy: bo
             segs.push(("Week", format!("{:.0}%", w.pct), Some(w.pct), level_color(w.pct, theme)));
             tip.push(format!("Weekly limit: {:.0}% used{}", w.pct, resets(&w)));
         }
-    } else if s.agy.running && show_agy {
-        icon = gemini_icon;
-        if let Some(l) = s.agy.live.as_ref().filter(|l| l.here) {
-            segs.push(("Context", tokens(l.context_tokens), None, GEMINI_BLUE));
-            tip.push(format!("Context: {} tokens  ·  {}  ·  {}", tokens(l.context_tokens), model_name(&l.model), l.label));
+    } else if let Some((st, name, ic, color)) = other {
+        icon = ic;
+        if let Some(l) = st.live.as_ref().filter(|l| l.here) {
+            match pct_of(l) {
+                Some(p) => {
+                    segs.push(("Context", format!("{p:.0}%"), Some(p), context_color(p, theme)));
+                    tip.push(format!("Context window: {p:.0}% used ({} tokens)  ·  {}", tokens(l.context_tokens), model_name(&l.model)));
+                }
+                None => {
+                    segs.push(("Context", tokens(l.context_tokens), None, color));
+                    tip.push(format!("Context: {} tokens  ·  {}  ·  {}", tokens(l.context_tokens), model_name(&l.model), l.label));
+                }
+            }
         }
-        let sum = |w: Window| s.agy.windows.get(&w).map_or(0, |v| v.iter().map(|m| m.total()).sum::<u64>());
+        let sum = |w: Window| st.windows.get(&w).map_or(0, |v| v.iter().map(|m| m.total()).sum::<u64>());
         let (h5, wk) = (sum(Window::FiveHours), sum(Window::Week));
-        segs.push(("5h", tokens(h5), None, GEMINI_BLUE));
-        segs.push(("Week", tokens(wk), None, GEMINI_BLUE));
-        tip.push(format!("Antigravity tokens: {} in the last 5 hours  ·  {} in the last 7 days", tokens(h5), tokens(wk)));
+        segs.push(("5h", tokens(h5), None, color));
+        segs.push(("Week", tokens(wk), None, color));
+        tip.push(format!("{name} tokens: {} in the last 5 hours  ·  {} in the last 7 days", tokens(h5), tokens(wk)));
     } else {
         return None;
     }

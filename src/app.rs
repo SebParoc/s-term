@@ -5,12 +5,20 @@
 //! - `panes`    : the terminal panes (layout animation, mouse, painting)
 //! - `palette`  : the command palette (Ctrl+Shift+P)
 //! - `settings` : the settings page (Ctrl+,)
+//! - `launch`   : runs the Launchpad's launchers in their panes
+//! - `history`  : records closed tabs and the session, reopens them
 
+mod ask;
 mod chrome;
 mod devshot;
+mod history;
+mod launch;
 mod palette;
 mod panes;
 mod settings;
+mod setup;
+
+pub(crate) use settings::segmented;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -73,8 +81,13 @@ pub struct STerm {
     central: Rect,
     /// Pane rectangles from the last frame (for directional focus).
     rects: Vec<(PaneId, Rect)>,
+    /// The tab bar's "+" button from the last frame (a folder dropped on it opens a new tab there).
+    plus_rect: Rect,
     window_title: String,
     palette: palette::Palette,
+    ask: ask::Ask,
+    /// First-run setup screen.
+    setup: Option<setup::Setup>,
     settings_open: bool,
     settings: settings::SettingsUi,
     last_follow: Instant,
@@ -87,6 +100,13 @@ pub struct STerm {
     zoom_accum: f32,
     /// "Font 15px" / "Zoom 110%" indicator and when it was triggered.
     zoom_hud: Option<(String, Instant)>,
+    /// Launchpad launchers that have a pane, by launcher id.
+    launches: HashMap<u64, launch::Run>,
+    /// What those panes are doing, refreshed a few times a second.
+    launch_status: crate::launchpad::Statuses,
+    launch_checked: Option<Instant>,
+    /// Closed tabs and the last session (the History view).
+    hist: history::HistState,
 }
 
 impl STerm {
@@ -126,8 +146,11 @@ impl STerm {
             sidebar: Sidebar::new(ctx.clone()),
             central: Rect::NOTHING,
             rects: Vec::new(),
+            plus_rect: Rect::NOTHING,
             window_title: String::new(),
             palette: Default::default(),
+            ask: Default::default(),
+            setup: None,
             settings_open: false,
             settings: Default::default(),
             last_follow: Instant::now() - Duration::from_secs(10),
@@ -140,6 +163,10 @@ impl STerm {
             ),
             zoom_accum: 1.0,
             zoom_hud: None,
+            launches: HashMap::new(),
+            launch_status: Default::default(),
+            launch_checked: None,
+            hist: Default::default(),
         };
         if app.config.zoom_ui {
             ctx.set_zoom_factor(app.config.ui_scale);
@@ -148,7 +175,11 @@ impl STerm {
             app.config.write_prompt_flags();
         }
         app.sidebar.open = app.config.panel_on_start;
+        if !app.config.setup_done && app.devshot.is_none() {
+            app.setup = Some(Default::default());
+        }
         app.new_tab();
+        app.history_start();
         app
     }
 
@@ -222,10 +253,14 @@ impl STerm {
     fn new_tab(&mut self) {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let cwd = if self.config.new_tab_home && !self.tabs.is_empty() { home } else { self.focused_cwd() };
-        if let Some(id) = self.spawn_pane(cwd) {
-            self.tabs.push(Tab { root: Node::Leaf(id), focus: id, zoomed: None, broadcast: false });
-            self.active = self.tabs.len() - 1;
-        }
+        self.open_tab_at(cwd);
+    }
+
+    fn open_tab_at(&mut self, cwd: Option<PathBuf>) -> Option<PaneId> {
+        let id = self.spawn_pane(cwd)?;
+        self.tabs.push(Tab { root: Node::Leaf(id), focus: id, zoomed: None, broadcast: false });
+        self.active = self.tabs.len() - 1;
+        Some(id)
     }
 
     /// Starts another S-term process, opened in the focused pane's folder.
@@ -248,19 +283,30 @@ impl STerm {
 
     fn split(&mut self, orient: Orientation) {
         let cwd = self.focused_cwd();
-        if self.tabs.is_empty() {
-            return;
-        }
-        if let Some(new) = self.spawn_pane(cwd) {
-            let tab = &mut self.tabs[self.active];
-            tab.root.split(tab.focus, new, orient);
-            tab.focus = new;
-            self.spawn_from.insert(new, orient);
-            tab.zoomed = None;
-        }
+        self.split_at(orient, cwd);
     }
 
+    fn split_at(&mut self, orient: Orientation, cwd: Option<PathBuf>) -> Option<PaneId> {
+        if self.tabs.is_empty() {
+            return None;
+        }
+        let new = self.spawn_pane(cwd)?;
+        let tab = &mut self.tabs[self.active];
+        tab.root.split(tab.focus, new, orient);
+        tab.focus = new;
+        self.spawn_from.insert(new, orient);
+        tab.zoomed = None;
+        Some(new)
+    }
+
+    /// Closes a pane (its tab too when it's the last one there), keeping it in the History.
     fn close_pane(&mut self, id: PaneId) {
+        self.remember_pane(id);
+        self.drop_pane(id);
+    }
+
+    /// Closes a pane without keeping it in the History.
+    fn drop_pane(&mut self, id: PaneId) {
         if self.panes.remove(&id).is_none() {
             return;
         }
@@ -292,8 +338,9 @@ impl STerm {
         if let Some(t) = self.tabs.get(ti) {
             t.root.leaves(&mut ids);
         }
+        self.remember_tab(ti);
         for id in ids {
-            self.close_pane(id);
+            self.drop_pane(id);
         }
     }
 
@@ -334,6 +381,7 @@ impl STerm {
     // ---------------------------------------------------------------- input
 
     fn send_input(&mut self, bytes: Vec<u8>) {
+        self.hist.typed();
         let Some(tab) = self.tab() else { return };
         let mut targets = Vec::new();
         if tab.broadcast {
@@ -432,6 +480,8 @@ impl STerm {
                 }
             }
             Action::ToggleSidebar => self.sidebar.toggle(),
+            Action::ReopenClosed => self.reopen_last(),
+            Action::ShowHistory => self.sidebar.toggle_view(crate::sidebar::Tab::History),
             Action::OpenPalette => self.palette.toggle(),
             Action::OpenSettings => self.settings_open = !self.settings_open,
             Action::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -502,15 +552,21 @@ impl STerm {
     }
 
     fn modal_open(&self) -> bool {
-        self.palette.open || self.settings_open || self.sidebar.viewer_active()
+        // The Ask popup in its own window leaves the terminal usable.
+        let ask_floating = self.palette.mode == palette::Mode::Ask && self.palette.ask_windowed;
+        (self.palette.open && !ask_floating) || self.settings_open || self.setup.is_some() || self.sidebar.viewer_active()
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
-        if self.modal_open() {
+        // So does a text field in the side panel (it reports this from the last frame).
+        if self.modal_open() || self.sidebar.typing() {
             // Overlays own the keyboard: Esc closes the top one, nothing reaches the shell.
             for ev in events {
                 if let egui::Event::Key { key, pressed: true, modifiers, .. } = ev {
+                    if self.setup.is_some() {
+                        continue;
+                    }
                     match input::action_for(key, modifiers) {
                         Some(Action::OpenPalette) => self.palette.toggle(),
                         Some(Action::OpenSettings) => {
@@ -619,6 +675,8 @@ impl STerm {
                     }
                 }
                 UiAction::Drop(path, pos) => self.drop_paths(&[path], pos),
+                UiAction::Launcher(id, op) => self.launch_op(id, op),
+                UiAction::History(id, op) => self.history_op(id, op),
             }
         }
     }
@@ -628,12 +686,33 @@ impl STerm {
         self.rects.iter().find(|(_, r)| r.contains(pos)).map(|(id, _)| *id)
     }
 
-    /// Files dropped on a pane: focus it and paste their absolute paths (Claude Code turns
-    /// pasted image paths into attachments).
+    /// Paths dropped somewhere in the window.
+    /// - On the tab bar's "+": one new tab per folder (a file opens its parent folder).
+    /// - On a pane at an empty shell prompt, a single folder: `cd` into it. With something
+    ///   typed already (say `cp -r `), the path is pasted instead.
+    /// - Otherwise: focus the pane and paste the quoted absolute paths (Claude Code turns
+    ///   pasted image paths into attachments).
     fn drop_paths(&mut self, paths: &[std::path::PathBuf], pos: egui::Pos2) {
+        if self.plus_rect.expand(4.0).contains(pos) {
+            for p in paths {
+                let dir = if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) };
+                self.open_tab_at(dir);
+            }
+            return;
+        }
         let Some(id) = self.pane_at(pos) else { return };
         if let Some(tab) = self.tabs.get_mut(self.active) {
             tab.focus = id;
+        }
+        if let [dir] = paths {
+            if dir.is_dir() && self.panes.get(&id).is_some_and(|p| p.at_empty_prompt()) {
+                if let Some(p) = self.panes.get(&id) {
+                    let cmd = format!("cd {}\r", crate::sidebar::quote(&dir.to_string_lossy()));
+                    p.term.lock().scroll_display(Scroll::Bottom);
+                    p.write(cmd.into_bytes());
+                }
+                return;
+            }
         }
         let text: Vec<String> = paths.iter().map(|p| crate::sidebar::quote(&p.to_string_lossy())).collect();
         self.paste(&format!("{} ", text.join(" ")));
@@ -712,7 +791,7 @@ impl eframe::App for STerm {
             self.status_bar(ctx);
         }
         self.rail(ctx);
-        let actions = self.sidebar.show(ctx, &self.theme, &mut self.config);
+        let actions = self.sidebar.show(ctx, &self.theme, &mut self.config, &self.launch_status, &self.hist.store);
         self.run_sidebar_actions(ctx, actions);
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -721,11 +800,21 @@ impl eframe::App for STerm {
         let actions = self.sidebar.show_viewer(ctx, &self.theme, self.central);
         self.run_sidebar_actions(ctx, actions);
         self.os_file_drops(ctx);
+        self.launch_tick(ctx);
+        self.history_tick(ctx);
+        self.restore_offer(ctx);
         if self.settings_open {
             self.settings_page(ctx);
         }
+        self.ask_tick(ctx);
         if self.palette.open {
             self.palette_ui(ctx);
+        } else {
+            self.palette.ask_shown = false;
+            self.palette.ask_windowed = false;
+        }
+        if self.setup.is_some() {
+            self.setup_ui(ctx);
         }
         self.zoom_hud(ctx);
         self.window_border(ctx);
@@ -733,12 +822,15 @@ impl eframe::App for STerm {
         self.devshot(ctx);
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The open tabs become the "last session" in the History.
+        self.history_exit();
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        if !self.config.system_titlebar {
-            // Transparent, so the rounded corners show the desktop behind them.
-            return [0.0; 4];
-        }
-        let c = self.theme.bar;
-        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+        // Transparent: frameless windows show the desktop at their rounded corners, and the Ask
+        // popup's window (which shares this) is see-through around its glass. The backdrop paints
+        // every pixel of the main window anyway.
+        [0.0; 4]
     }
 }

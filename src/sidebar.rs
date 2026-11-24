@@ -1,4 +1,5 @@
-//! Side panel: git changes, file tree and a diff/file viewer for the focused pane's folder.
+//! Side panel: git changes, file tree and a diff/file viewer for the focused pane's folder, plus the
+//! Launchpad, History and AI usage views (drawn by `launchpad.rs`, `history.rs` and `usage_ui.rs`).
 //!
 //! All filesystem and git work happens on a background thread that refreshes about once a
 //! second; the UI only reads the latest snapshot, so it never blocks rendering.
@@ -35,6 +36,47 @@ fn ext_in(p: &Path, list: &[&str]) -> bool {
 
 pub fn is_image(p: &Path) -> bool {
     ext_in(p, IMAGE_EXTS)
+}
+
+/// The Explorer icon for a path, and its color (taken from the theme's ANSI palette).
+pub fn file_icon(path: &Path, is_dir: bool, open: bool, theme: &Theme) -> (crate::icons::Icon, Color32) {
+    use crate::icons::Icon;
+    let pal = |i: usize| c32(theme.palette[i]);
+    if is_dir {
+        return (if open { Icon::FolderOpen } else { Icon::Folder }, theme.accent2);
+    }
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_ascii_lowercase();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    match name.as_str() {
+        ".gitignore" | ".gitattributes" | ".gitmodules" => return (Icon::Git, pal(1)),
+        "dockerfile" | "makefile" | "justfile" | "cmakelists.txt" | ".editorconfig" => return (Icon::Gear, pal(4)),
+        "license" | "licence" | "copying" => return (Icon::FileText, pal(3)),
+        _ if name.ends_with(".lock") || name == "package-lock.json" => return (Icon::Lock, theme.muted),
+        _ if name.starts_with(".env") => return (Icon::FileConfig, pal(3)),
+        _ => {}
+    }
+    match ext.as_str() {
+        "rs" => (Icon::FileCode, pal(1)),
+        "py" | "pyi" => (Icon::FileCode, pal(4)),
+        "js" | "mjs" | "cjs" | "jsx" => (Icon::FileCode, pal(3)),
+        "ts" | "mts" | "tsx" => (Icon::FileCode, pal(12)),
+        "go" | "dart" => (Icon::FileCode, pal(6)),
+        "c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" | "mm" | "cs" | "zig" | "nim" => (Icon::FileCode, pal(4)),
+        "java" | "kt" | "kts" | "scala" | "swift" | "rb" | "php" | "html" | "htm" | "vue" | "svelte" => (Icon::FileCode, pal(9)),
+        "css" | "scss" | "sass" | "less" => (Icon::FileCode, pal(5)),
+        "lua" | "hs" | "ml" | "ex" | "exs" | "erl" | "clj" | "el" | "r" | "jl" | "sql" | "wgsl" | "glsl" | "hlsl" => (Icon::FileCode, pal(6)),
+        "json" | "jsonc" | "json5" | "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" | "xml" | "plist" | "ron" | "nix" | "csv" | "tsv" => {
+            (Icon::FileConfig, pal(3))
+        }
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" | "nu" => (Icon::FileScript, pal(2)),
+        "md" | "mdx" | "markdown" | "txt" | "rst" | "adoc" | "org" | "tex" | "pdf" | "doc" | "docx" | "odt" | "rtf" => (Icon::FileText, pal(12)),
+        "zip" | "tar" | "gz" | "tgz" | "xz" | "bz2" | "zst" | "7z" | "rar" | "deb" | "rpm" | "jar" | "whl" | "crate" => (Icon::Archive, pal(5)),
+        "lock" | "pem" | "key" | "crt" | "gpg" | "asc" => (Icon::Lock, theme.muted),
+        "mp3" | "wav" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "mp4" | "mkv" | "webm" | "mov" | "avi" => (Icon::Media, pal(13)),
+        "ttf" | "otf" | "woff" | "woff2" => (Icon::Font, pal(14)),
+        _ if is_image(path) => (Icon::Image, theme.accent2),
+        _ => (Icon::File, Color32::from_gray(150)),
+    }
 }
 
 // ------------------------------------------------------------------------------------------ data
@@ -182,7 +224,12 @@ pub struct FileView {
     pub note: Option<String>,
     /// Decoded image (image files only); uploaded to a texture by the UI.
     pub image: Option<egui::ColorImage>,
+    /// Markdown source, for `.md` files (shown rendered when the toggle is on).
+    pub markdown: Option<String>,
 }
+
+/// Text selection in the viewer: anchor and cursor, each `(line, column)` in chars.
+type Sel = ((usize, usize), (usize, usize));
 
 // ---------------------------------------------------------------------------------------- worker
 
@@ -453,7 +500,7 @@ fn classify(lines: impl Iterator<Item = String>, diff: bool) -> FileView {
         max_len = max_len.max(l.chars().count());
         out.push((kind, l));
     }
-    FileView { title: String::new(), abs: PathBuf::new(), is_diff: diff, lines: out, max_len, adds, dels, note: None, image: None }
+    FileView { title: String::new(), abs: PathBuf::new(), is_diff: diff, lines: out, max_len, adds, dels, note: None, image: None, markdown: None }
 }
 
 fn load_text(abs: &Path) -> Result<String, String> {
@@ -529,8 +576,15 @@ fn load_preview(abs: &Path, title: String) -> FileView {
         view.abs = abs.to_path_buf();
         return view;
     }
+    let is_md = ext_in(abs, &["md", "markdown", "mdx"]);
     let mut view = match load_text(abs) {
-        Ok(t) => classify(t.lines().map(String::from), false),
+        Ok(t) => {
+            let mut v = classify(t.lines().map(String::from), false);
+            if is_md {
+                v.markdown = Some(t);
+            }
+            v
+        }
         Err(e) => FileView { note: Some(e), ..classify(std::iter::empty(), false) },
     };
     view.title = title;
@@ -544,6 +598,8 @@ fn load_preview(abs: &Path, title: String) -> FileView {
 pub enum Tab {
     Changes,
     Files,
+    Launch,
+    History,
     Ai,
 }
 
@@ -555,6 +611,10 @@ pub enum UiAction {
     OpenExternal(PathBuf),
     /// A file was dragged out of the panel and released at this screen position.
     Drop(PathBuf, egui::Pos2),
+    /// Run, stop, show… a Launchpad launcher (by id).
+    Launcher(u64, crate::launchpad::Op),
+    /// Reopen, delete… a History entry (by id).
+    History(u64, crate::history::Op),
 }
 
 pub struct Sidebar {
@@ -572,9 +632,17 @@ pub struct Sidebar {
     extra_snaps: Arc<Mutex<Vec<Arc<Snapshot>>>>,
     /// "Add folder" field, while open.
     adding: Option<String>,
+    /// Put the cursor in the "Add folder" field (once, when it opens).
+    adding_focus: bool,
+    /// A text field in the panel has the keyboard this frame.
+    typing: bool,
     /// Folder picked in the system dialog, delivered by its thread.
     picked: Arc<Mutex<Option<PathBuf>>>,
     watching: Option<PathBuf>,
+    /// The focused pane's cwd, as last reported by `follow` (the Explorer may be browsing above it).
+    cwd: Option<PathBuf>,
+    /// Folders the Explorer showed before each "up", most recent last ("down" returns to them).
+    up_stack: Vec<PathBuf>,
     watched_root: Option<PathBuf>,
     last_follow: Instant,
     tx: Sender<Req>,
@@ -583,10 +651,16 @@ pub struct Sidebar {
     pub viewer: Option<FileView>,
     viewer_loading: bool,
     viewer_tex: Option<egui::TextureHandle>,
+    viewer_sel: Option<Sel>,
+    /// Markdown files: show them rendered instead of as source.
+    md_rendered: bool,
+    md_cache: egui_commonmark::CommonMarkCache,
     /// File being dragged out of the panel (towards a pane).
     dragging: Option<PathBuf>,
     pub usage: crate::usage::Usage,
     usage_ui: crate::usage_ui::UsageUi,
+    launchpad: crate::launchpad::LaunchpadUi,
+    history_ui: crate::history::HistoryUi,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -605,6 +679,20 @@ fn ago(t: Option<SystemTime>) -> (String, f32) {
         s => format!("{}d", s / 86400),
     };
     (s, secs)
+}
+
+/// Opens the system folder picker (zenity) on a background thread; the choice lands in `slot`.
+pub fn pick_folder(title: &str, slot: Arc<Mutex<Option<PathBuf>>>) {
+    let title = format!("--title={title}");
+    let _ = std::thread::Builder::new().name("s-term-pick".into()).spawn(move || {
+        let out = Command::new("zenity").args(["--file-selection", "--directory", &title]).stderr(Stdio::null()).output();
+        if let Some(o) = out.ok().filter(|o| o.status.success()) {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !p.is_empty() {
+                *lock(&slot) = Some(PathBuf::from(p));
+            }
+        }
+    });
 }
 
 /// Shell-safe-ish path for typing into a prompt.
@@ -642,6 +730,8 @@ struct TreeCx<'a> {
     preview: Option<(PathBuf, String)>,
     /// A folder to add as its own Explorer section.
     pin: Option<PathBuf>,
+    /// A folder to make a Launchpad launcher for.
+    launcher: Option<PathBuf>,
 }
 
 impl<'a> TreeCx<'a> {
@@ -654,7 +744,7 @@ impl<'a> TreeCx<'a> {
         actions: &'a mut Vec<UiAction>,
         dragging: &'a mut Option<PathBuf>,
     ) -> Self {
-        Self { theme, snap, base, expanded, hide_ignored, actions, dragging, toggled: None, preview: None, pin: None }
+        Self { theme, snap, base, expanded, hide_ignored, actions, dragging, toggled: None, preview: None, pin: None, launcher: None }
     }
 }
 
@@ -710,8 +800,12 @@ impl Sidebar {
             sent: Watch::default(),
             extra_snaps,
             adding: None,
+            adding_focus: false,
+            typing: false,
             picked: Arc::default(),
             watching: None,
+            cwd: None,
+            up_stack: Vec::new(),
             watched_root: None,
             last_follow: Instant::now() - Duration::from_secs(10),
             tx,
@@ -720,9 +814,14 @@ impl Sidebar {
             viewer: None,
             viewer_loading: false,
             viewer_tex: None,
+            viewer_sel: None,
+            md_rendered: true,
+            md_cache: Default::default(),
             dragging: None,
             usage,
             usage_ui: Default::default(),
+            launchpad: Default::default(),
+            history_ui: Default::default(),
         }
     }
 
@@ -749,6 +848,18 @@ impl Sidebar {
         self.tab = tab;
     }
 
+    /// A text field in the panel has the keyboard, so keys must not also go to the shell.
+    pub fn typing(&self) -> bool {
+        self.typing || self.launchpad.typing
+    }
+
+    /// Opens the Launchpad with a new launcher for `dir` (default: the followed folder).
+    pub fn new_launcher(&mut self, dir: Option<PathBuf>) {
+        self.show_view(Tab::Launch);
+        let dir = dir.or_else(|| self.cwd.clone());
+        self.launchpad.new_draft(dir.as_deref());
+    }
+
     /// Latest git/files snapshot of the followed folder (also used by the status bar).
     pub fn snapshot(&self) -> Option<Arc<Snapshot>> {
         lock(&self.snap).clone().filter(|s| Some(&s.dir) == self.watching.as_ref())
@@ -757,8 +868,32 @@ impl Sidebar {
     pub fn follow(&mut self, cwd: Option<PathBuf>) {
         self.last_follow = Instant::now();
         self.usage.set_focus(cwd.clone());
-        if cwd.is_some() && cwd != self.watching {
-            self.watching = cwd;
+        // A new cwd ends any browsing above it: the Explorer jumps back to the pane's folder.
+        if cwd.is_some() && cwd != self.cwd {
+            self.cwd = cwd.clone();
+            self.up_stack.clear();
+            if cwd != self.watching {
+                self.watching = cwd;
+                self.send_watch();
+            }
+        }
+    }
+
+    /// Explorer "up": show the parent of the tree's current top folder.
+    fn go_up(&mut self) {
+        let Some(top) = self.snapshot().map(|s| s.root.clone()).or_else(|| self.watching.clone()) else { return };
+        if let Some(parent) = top.parent() {
+            if let Some(w) = self.watching.replace(parent.to_path_buf()) {
+                self.up_stack.push(w);
+            }
+            self.send_watch();
+        }
+    }
+
+    /// Explorer "down": undo the last "up".
+    fn go_down(&mut self) {
+        if let Some(prev) = self.up_stack.pop() {
+            self.watching = Some(prev);
             self.send_watch();
         }
     }
@@ -782,24 +917,11 @@ impl Sidebar {
         }
     }
 
-    /// Opens the system folder picker (zenity) on a background thread.
-    fn browse(&self) {
-        let picked = self.picked.clone();
-        let _ = std::thread::Builder::new().name("s-term-pick".into()).spawn(move || {
-            let out = Command::new("zenity").args(["--file-selection", "--directory", "--title=Add folder to Explorer"]).stderr(Stdio::null()).output();
-            if let Some(o) = out.ok().filter(|o| o.status.success()) {
-                let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if !p.is_empty() {
-                    *lock(&picked) = Some(PathBuf::from(p));
-                }
-            }
-        });
-    }
-
     /// Starts adding an Explorer folder (panel button, command palette).
     pub fn start_adding(&mut self) {
         self.show_view(Tab::Files);
         self.adding.get_or_insert_with(String::new);
+        self.adding_focus = true;
     }
 
     fn open_diff(&mut self, root: &Path, c: &Change) {
@@ -836,8 +958,8 @@ impl Sidebar {
         let r = Rect::from_min_size(pos + vec2(14.0, 10.0), g.size() + vec2(34.0, 10.0));
         p.rect_filled(r, 7.0, theme.elevated);
         p.rect_stroke(r, 7.0, egui::Stroke::new(1.0_f32, theme.accent.gamma_multiply(0.8)));
-        let icon = if is_image(path) { crate::icons::Icon::Image } else if path.is_dir() { crate::icons::Icon::Folder } else { crate::icons::Icon::Files };
-        crate::icons::draw(&p, icon, crate::icons::center_rect(pos2(r.min.x + 13.0, r.center().y), 14.0), theme.accent);
+        let (icon, ic) = file_icon(path, path.is_dir(), false, theme);
+        crate::icons::draw(&p, icon, crate::icons::center_rect(pos2(r.min.x + 13.0, r.center().y), 14.0), ic);
         p.galley(pos2(r.min.x + 26.0, r.center().y - g.size().y / 2.0), g, theme.text);
     }
 
@@ -848,8 +970,17 @@ impl Sidebar {
         let _ = self.tx.send(Req::Preview(path, title));
     }
 
+    fn set_view(&mut self, v: FileView) {
+        self.viewer_tex = None;
+        self.viewer_sel = None;
+        self.md_cache = Default::default();
+        self.viewer = Some(v);
+        self.viewer_loading = false;
+    }
+
     pub fn close_viewer(&mut self) {
         self.viewer_tex = None;
+        self.viewer_sel = None;
         self.viewer = None;
         self.viewer_loading = false;
     }
@@ -881,12 +1012,15 @@ impl Sidebar {
 
     // ------------------------------------------------------------------------------- panel UI
 
-    pub fn show(&mut self, ctx: &egui::Context, theme: &Theme, cfg: &mut crate::config::Config) -> Vec<UiAction> {
+    /// The panel. `runs` is what each Launchpad launcher's pane is doing; `hist` is the History.
+    pub fn show(&mut self, ctx: &egui::Context, theme: &Theme, cfg: &mut crate::config::Config, runs: &crate::launchpad::Statuses, hist: &crate::history::History) -> Vec<UiAction> {
         let mut actions = Vec::new();
-        if let Some(v) = lock(&self.loaded_view).take() {
-            self.viewer_tex = None;
-            self.viewer = Some(v);
-            self.viewer_loading = false;
+        // Set again below by whichever field has the keyboard.
+        self.typing = false;
+        self.launchpad.typing = false;
+        let loaded = lock(&self.loaded_view).take();
+        if let Some(v) = loaded {
+            self.set_view(v);
         }
         self.drag_chip(ctx, theme);
         self.sync_settings(cfg);
@@ -913,6 +1047,8 @@ impl Sidebar {
                 let (title, count) = match self.tab {
                     Tab::Changes => ("SOURCE CONTROL", snap.as_ref().and_then(|s| s.git.as_ref()).map(|g| g.changes.len())),
                     Tab::Files => ("EXPLORER", None),
+                    Tab::Launch => ("LAUNCHPAD", Some(runs.values().filter(|s| s.busy()).count())),
+                    Tab::History => ("HISTORY", None),
                     Tab::Ai => ("AI USAGE", None),
                 };
                 ui.horizontal(|ui| {
@@ -927,12 +1063,60 @@ impl Sidebar {
                         {
                             self.open = false;
                         }
+                        if self.tab == Tab::Files {
+                            let top = snap.as_ref().map(|s| s.root.clone());
+                            let can_up = top.as_ref().is_some_and(|t| t.parent().is_some());
+                            let tip = match top.as_ref().and_then(|t| t.parent()) {
+                                Some(p) => format!("Up to {}  ·  cd in the terminal to come back", p.display()),
+                                None => "Already at the top".into(),
+                            };
+                            let color = if can_up { theme.muted } else { theme.muted.gamma_multiply(0.4) };
+                            if crate::icons::button(ui, crate::icons::Icon::ArrowUp, 22.0, color, theme.header, false, Id::new("s-term-sb-up"))
+                                .on_hover_text(tip)
+                                .clicked()
+                                && can_up
+                            {
+                                self.go_up();
+                            }
+                            let can_down = !self.up_stack.is_empty();
+                            let tip = match self.up_stack.last() {
+                                Some(p) => format!("Back to {}", p.display()),
+                                None => "Already at the terminal's folder".into(),
+                            };
+                            let color = if can_down { theme.muted } else { theme.muted.gamma_multiply(0.4) };
+                            if crate::icons::button(ui, crate::icons::Icon::ArrowDown, 22.0, color, theme.header, false, Id::new("s-term-sb-down"))
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                self.go_down();
+                            }
+                        }
+                        if self.tab == Tab::History
+                            && !hist.entries.is_empty()
+                            && crate::icons::button(ui, crate::icons::Icon::Trash, 22.0, theme.muted, theme.header, self.history_ui.confirm_clear, Id::new("s-term-sb-hist-clear"))
+                                .on_hover_text("Clear history")
+                                .clicked()
+                        {
+                            self.history_ui.confirm_clear = !self.history_ui.confirm_clear;
+                        }
+                        if self.tab == Tab::Launch
+                            && crate::icons::button(ui, crate::icons::Icon::Plus, 22.0, theme.muted, theme.header, self.launchpad.editing_new(), Id::new("s-term-sb-launch-add"))
+                                .on_hover_text("New launcher")
+                                .clicked()
+                        {
+                            if self.launchpad.editing_new() {
+                                self.launchpad.close_editor();
+                            } else {
+                                self.launchpad.new_draft(self.cwd.as_deref());
+                            }
+                        }
                         if self.tab == Tab::Files
                             && crate::icons::button(ui, crate::icons::Icon::Plus, 22.0, theme.muted, theme.header, self.adding.is_some(), Id::new("s-term-sb-add"))
                                 .on_hover_text("Add a folder to the Explorer")
                                 .clicked()
                         {
                             self.adding = if self.adding.is_some() { None } else { Some(String::new()) };
+                            self.adding_focus = self.adding.is_some();
                         }
                     });
                 });
@@ -947,6 +1131,19 @@ impl Sidebar {
                 }
                 if self.tab == Tab::Files {
                     self.files(ui, theme, snap.as_deref(), cfg, &mut actions);
+                    return;
+                }
+                if self.tab == Tab::Launch {
+                    let cwd = self.cwd.clone();
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        crate::launchpad::panel(ui, theme, &mut self.launchpad, cfg, runs, cwd.as_deref(), &mut actions);
+                    });
+                    return;
+                }
+                if self.tab == Tab::History {
+                    egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                        crate::history::panel(ui, theme, &mut self.history_ui, hist, &mut actions);
+                    });
                     return;
                 }
                 let Some(snap) = snap else {
@@ -1211,12 +1408,13 @@ impl Sidebar {
                     color = theme.muted.gamma_multiply(0.7);
                 }
                 if e.is_dir {
-                    p.text(pos2(x, y), Align2::LEFT_CENTER, if is_open { "▾" } else { "▸" }, small.clone(), theme.muted);
-                } else if is_image(&e.path) {
-                    let ic = if ignored { color } else { theme.accent2.gamma_multiply(0.9) };
-                    crate::icons::draw(p, crate::icons::Icon::Image, crate::icons::center_rect(pos2(x + 4.0, y), 12.0), ic);
+                    let chev = if is_open { crate::icons::Icon::ChevronDown } else { crate::icons::Icon::ChevronRight };
+                    crate::icons::draw(p, chev, crate::icons::center_rect(pos2(x + 3.0, y), 10.0), theme.muted);
                 }
-                let nr = p.text(pos2(x + 14.0, y), Align2::LEFT_CENTER, &e.name, font.clone(), color);
+                let (icon, ic) = file_icon(&e.path, e.is_dir, is_open, theme);
+                let ic = if ignored { color } else { ic.gamma_multiply(0.9) };
+                crate::icons::draw(p, icon, crate::icons::center_rect(pos2(x + 16.0, y), 13.0), ic);
+                let nr = p.text(pos2(x + 27.0, y), Align2::LEFT_CENTER, &e.name, font.clone(), color);
                 if let Some(k) = kind {
                     p.text(pos2(nr.max.x + 6.0, y), Align2::LEFT_CENTER, k.badge(), small.clone(), k.color(theme));
                 }
@@ -1237,11 +1435,15 @@ impl Sidebar {
                 cx.actions.push(UiAction::Insert(Self::insert_text(cx.base, &e.path)));
             }
             Self::drag_source(cx.dragging, &resp, &e.path, cx.actions);
-            let resp = if resp.dragged() { resp } else { resp.on_hover_text("Drag into a pane to insert the path") };
+            let resp = if resp.dragged() { resp } else { resp.on_hover_text(if e.is_dir { "Drag into a pane to cd there (or insert the path after a command) · onto + for a new tab" } else { "Drag into a pane to insert the path" }) };
             resp.context_menu(|ui| {
                 Self::path_menu(ui, cx.base, &e.path, cx.actions);
                 if e.is_dir && ui.button("Add to Explorer as a section").clicked() {
                     cx.pin = Some(e.path.clone());
+                    ui.close_menu();
+                }
+                if e.is_dir && ui.button("New launcher for this folder…").clicked() {
+                    cx.launcher = Some(e.path.clone());
                     ui.close_menu();
                 }
             });
@@ -1262,13 +1464,14 @@ impl Sidebar {
             self.add_row(ui, theme, cfg);
             ui.add_space(8.0);
         }
-        let base = snap.map(|s| s.dir.clone()).unwrap_or_default();
+        let base = self.cwd.clone().or_else(|| snap.map(|s| s.dir.clone())).unwrap_or_default();
         let folders = cfg.explorer_folders.clone();
         let extras = lock(&self.extra_snaps).clone();
         let gap = 8.0;
         let width = ui.available_width();
         let mut preview = None;
         let mut pin = None;
+        let mut launcher = None;
 
         // ---- followed project (its card sits above the shared area, so every tree gets the same height)
         if let Some(snap) = snap {
@@ -1293,7 +1496,7 @@ impl Sidebar {
             egui::ScrollArea::vertical().id_salt("s-term-files-main").auto_shrink(false).show(ui, |ui| {
                 let mut cx = TreeCx::new(theme, snap, &base, &self.expanded, cfg.hide_ignored, actions, &mut self.dragging);
                 Self::tree(ui, &mut cx, &snap.root, 0);
-                (preview, pin) = (cx.preview.take().or(preview.take()), cx.pin.take());
+                (preview, pin, launcher) = (cx.preview.take().or(preview.take()), cx.pin.take(), cx.launcher.take());
                 if let Some(d) = cx.toggled.take() {
                     if !self.expanded.remove(&d) {
                         self.expanded.insert(d);
@@ -1359,6 +1562,9 @@ impl Sidebar {
                     if let Some(p) = cx.pin.take() {
                         pin = Some(p);
                     }
+                    if let Some(p) = cx.launcher.take() {
+                        launcher = Some(p);
+                    }
                     if let Some(d) = cx.toggled.take() {
                         if !self.extra_expanded.remove(&d) {
                             self.extra_expanded.insert(d);
@@ -1375,6 +1581,9 @@ impl Sidebar {
         }
         if let Some(p) = pin {
             Self::add_folder(cfg, p);
+        }
+        if let Some(p) = launcher {
+            self.new_launcher(Some(p));
         }
         if let Some((p, t)) = preview {
             self.viewer_loading = true;
@@ -1430,9 +1639,10 @@ impl Sidebar {
             ui.label(RichText::new("Add a folder to the Explorer").size(12.0).color(theme.text));
             ui.add_space(4.0);
             let r = ui.add(egui::TextEdit::singleline(text).hint_text("~/projects/other").desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-            if !r.has_focus() && !r.lost_focus() && text.is_empty() {
+            if std::mem::take(&mut self.adding_focus) {
                 r.request_focus();
             }
+            self.typing = ui.memory(|m| m.has_focus(r.id));
             let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let path = PathBuf::from(text.trim());
             let expanded = match (path.strip_prefix("~"), std::env::var_os("HOME")) {
@@ -1458,7 +1668,7 @@ impl Sidebar {
             });
         });
         if browse {
-            self.browse();
+            pick_folder("Add folder to Explorer", self.picked.clone());
         }
         if done {
             self.adding = None;
@@ -1517,10 +1727,9 @@ impl Sidebar {
     /// Diff / file viewer floating over the terminal area.
     pub fn show_viewer(&mut self, ctx: &egui::Context, theme: &Theme, area: Rect) -> Vec<UiAction> {
         let mut actions = Vec::new();
-        if let Some(v) = lock(&self.loaded_view).take() {
-            self.viewer_tex = None;
-            self.viewer = Some(v);
-            self.viewer_loading = false;
+        let loaded = lock(&self.loaded_view).take();
+        if let Some(v) = loaded {
+            self.set_view(v);
         }
         if !self.viewer_active() {
             return actions;
@@ -1565,9 +1774,28 @@ impl Sidebar {
                                 ui.label(RichText::new(format!("+{}", v.adds)).monospace().color(c32(theme.palette[2])));
                                 ui.label(RichText::new(format!("−{}", v.dels)).monospace().color(c32(theme.palette[1])));
                             }
+                            if v.markdown.is_some() {
+                                ui.add_space(8.0);
+                                if ui.selectable_label(self.md_rendered, "Preview").on_hover_text("Show the Markdown formatted").clicked() {
+                                    self.md_rendered = true;
+                                }
+                                if ui.selectable_label(!self.md_rendered, "Source").on_hover_text("Show the raw Markdown").clicked() {
+                                    self.md_rendered = false;
+                                    self.viewer_sel = None;
+                                }
+                            }
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.button("✕  Esc").clicked() {
                                     close = true;
+                                }
+                                if v.image.is_none() {
+                                    let rendered = v.markdown.is_some() && self.md_rendered;
+                                    let sel = if rendered { None } else { sel_text(v, self.viewer_sel) };
+                                    let label = if sel.is_some() { "Copy selection" } else { "Copy all" };
+                                    if ui.button(label).on_hover_text("Copy the text to the clipboard").clicked() {
+                                        let all = || v.markdown.clone().unwrap_or_else(|| v.lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n"));
+                                        actions.push(UiAction::Copy(sel.unwrap_or_else(all)));
+                                    }
                                 }
                                 if ui.button("Open").on_hover_text("Open with the default app").clicked() {
                                     actions.push(UiAction::OpenExternal(v.abs.clone()));
@@ -1592,8 +1820,10 @@ impl Sidebar {
                                 ui.ctx().load_texture("s-term-viewer-image", img.clone(), egui::TextureOptions::LINEAR)
                             });
                             Self::image(ui, theme, tex);
-                        } else {
-                            Self::lines(ui, theme, v);
+                        } else if let (Some(md), true) = (&v.markdown, self.md_rendered) {
+                            Self::markdown(ui, &mut self.md_cache, md);
+                        } else if let Some(t) = Self::lines(ui, theme, v, &mut self.viewer_sel) {
+                            actions.push(UiAction::Copy(t));
                         }
                     });
             });
@@ -1628,18 +1858,108 @@ impl Sidebar {
         p.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, theme.rim));
     }
 
-    fn lines(ui: &mut egui::Ui, theme: &Theme, v: &FileView) {
+    /// Rendered Markdown in a readable centered column; its text is selectable like any label.
+    fn markdown(ui: &mut egui::Ui, cache: &mut egui_commonmark::CommonMarkCache, md: &str) {
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            let avail = ui.available_width();
+            let w = avail.min(920.0);
+            ui.horizontal_top(|ui| {
+                ui.add_space(((avail - w) / 2.0).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(w);
+                    ui.style_mut().interaction.selectable_labels = true;
+                    egui_commonmark::CommonMarkViewer::new().show(ui, cache, md);
+                    ui.add_space(24.0);
+                });
+            });
+        });
+    }
+
+    /// File/diff lines with mouse selection (drag, double-click word, triple-click line,
+    /// shift-click to extend, Ctrl+A). Returns the selected text when the user copies.
+    fn lines(ui: &mut egui::Ui, theme: &Theme, v: &FileView, sel: &mut Option<Sel>) -> Option<String> {
         let font = FontId::monospace(13.0);
         let (cw, row_h) = ui.fonts(|f| (f.glyph_width(&font, 'M'), f.row_height(&font) + 2.0));
-        let gutter = if v.is_diff { 0.0 } else { cw * (v.lines.len().max(1).ilog10() as f32 + 2.0) + 8.0 };
+        let gutter = if v.is_diff { 6.0 } else { cw * (v.lines.len().max(1).ilog10() as f32 + 2.0) + 8.0 };
         let content_w = (gutter + v.max_len as f32 * cw + 24.0).max(ui.available_width());
         let green = c32(theme.palette[2]);
         let red = c32(theme.palette[1]);
-        egui::ScrollArea::both().auto_shrink(false).show_rows(ui, row_h, v.lines.len(), |ui, range| {
-            for i in range {
+        let n = v.lines.len();
+        if n == 0 {
+            return None;
+        }
+        let len = |i: usize| v.lines[i].1.chars().count();
+
+        let (copy_ev, select_all, shift) = ui.input(|i| {
+            (i.events.iter().any(|e| matches!(e, egui::Event::Copy)), i.modifiers.command && i.key_pressed(egui::Key::A), i.modifiers.shift)
+        });
+        if select_all {
+            *sel = Some(((0, 0), (n - 1, len(n - 1))));
+        }
+        let copy = if copy_ev { sel_text(v, *sel) } else { None };
+
+        egui::ScrollArea::both().auto_shrink(false).drag_to_scroll(false).show_viewport(ui, |ui, viewport| {
+            let origin = ui.max_rect().min;
+            let total = vec2(content_w, row_h * n as f32);
+            ui.allocate_rect(Rect::from_min_size(origin, total), Sense::hover());
+            let hit_rect = Rect::from_min_size(origin, total.max(viewport.max.to_vec2()));
+            let resp = ui.interact(hit_rect, ui.id().with("s-term-viewer-sel"), Sense::click_and_drag());
+            if resp.hovered() || resp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+            }
+            let hit = |p: egui::Pos2| -> (usize, usize) {
+                let y = p.y - origin.y;
+                if y < 0.0 {
+                    return (0, 0);
+                }
+                let line = (y / row_h) as usize;
+                if line >= n {
+                    return (n - 1, len(n - 1));
+                }
+                let col = ((p.x - origin.x - gutter) / cw).round().max(0.0) as usize;
+                (line, col.min(len(line)))
+            };
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let at = hit(pos);
+                if resp.triple_clicked() {
+                    *sel = Some(((at.0, 0), (at.0, len(at.0))));
+                } else if resp.double_clicked() {
+                    let (a, b) = word_at(&v.lines[at.0].1, at.1);
+                    *sel = Some(((at.0, a), (at.0, b)));
+                } else if resp.drag_started() {
+                    let from = ui.input(|i| i.pointer.press_origin()).map(hit).unwrap_or(at);
+                    let anchor = match *sel {
+                        Some((a, _)) if shift => a,
+                        _ => from,
+                    };
+                    *sel = Some((anchor, at));
+                } else if resp.dragged() {
+                    if let Some(s) = sel.as_mut() {
+                        s.1 = at;
+                    }
+                    // Keep scrolling while the pointer is held past the top/bottom edge.
+                    let clip = ui.clip_rect();
+                    let dy = if pos.y < clip.top() { clip.top() - pos.y } else if pos.y > clip.bottom() { clip.bottom() - pos.y } else { 0.0 };
+                    if dy != 0.0 {
+                        ui.scroll_with_delta(vec2(0.0, dy.clamp(-60.0, 60.0)));
+                        ui.ctx().request_repaint();
+                    }
+                } else if resp.clicked() {
+                    *sel = match *sel {
+                        Some((a, _)) if shift => Some((a, at)),
+                        _ => None,
+                    };
+                }
+            }
+
+            let ordered = sel.map(|(a, b)| if a <= b { (a, b) } else { (b, a) }).filter(|(a, b)| a != b);
+            let sel_fill = theme.accent.gamma_multiply(0.32);
+            let first = ((viewport.min.y / row_h).floor().max(0.0) as usize).min(n);
+            let last = ((viewport.max.y / row_h).ceil() as usize + 1).min(n);
+            let p = ui.painter();
+            for i in first..last {
                 let (kind, text) = &v.lines[i];
-                let (r, _) = ui.allocate_exact_size(vec2(content_w, row_h), Sense::hover());
-                let p = ui.painter();
+                let r = Rect::from_min_size(origin + vec2(0.0, i as f32 * row_h), vec2(content_w, row_h));
                 let (bg, fg) = match kind {
                     LineKind::Add => (Some(green.gamma_multiply(0.12)), lerp_color(green, Color32::WHITE, 0.3)),
                     LineKind::Del => (Some(red.gamma_multiply(0.12)), lerp_color(red, Color32::WHITE, 0.3)),
@@ -1650,18 +1970,74 @@ impl Sidebar {
                 if let Some(bg) = bg {
                     p.rect_filled(r, 0.0, bg);
                 }
+                if let Some(((sl, sc), (el, ec))) = ordered {
+                    if (sl..=el).contains(&i) {
+                        let a = if i == sl { sc } else { 0 } as f32;
+                        // Past the line end, a half cell stands for the selected newline.
+                        let b = if i == el { ec as f32 } else { len(i) as f32 + 0.5 };
+                        if b > a {
+                            let x0 = r.min.x + gutter + a * cw;
+                            p.rect_filled(Rect::from_x_y_ranges(x0..=r.min.x + gutter + b * cw, r.y_range()), 0.0, sel_fill);
+                        }
+                    }
+                }
                 if !v.is_diff {
                     p.text(pos2(r.min.x + gutter - 12.0, r.center().y), Align2::RIGHT_CENTER, (i + 1).to_string(), font.clone(), theme.muted.gamma_multiply(0.7));
                 }
                 p.text(pos2(r.min.x + gutter, r.center().y), Align2::LEFT_CENTER, text, font.clone(), fg);
             }
         });
+        copy
     }
+}
+
+/// The selected text, or `None` when nothing is selected.
+fn sel_text(v: &FileView, sel: Option<Sel>) -> Option<String> {
+    let (a, b) = sel?;
+    let ((sl, sc), (el, ec)) = if a <= b { (a, b) } else { (b, a) };
+    if (sl, sc) == (el, ec) || el >= v.lines.len() {
+        return None;
+    }
+    let mut out = String::new();
+    for i in sl..=el {
+        let line = &v.lines[i].1;
+        let from = if i == sl { sc } else { 0 };
+        let to = if i == el { ec } else { usize::MAX };
+        out.extend(line.chars().skip(from).take(to.saturating_sub(from)));
+        if i != el {
+            out.push('\n');
+        }
+    }
+    Some(out)
+}
+
+/// Char range of the word (or run of spaces / punctuation) around `col`.
+fn word_at(line: &str, col: usize) -> (usize, usize) {
+    let chars: Vec<char> = line.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let class = |c: char| if c.is_alphanumeric() || c == '_' { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let i = col.min(chars.len() - 1);
+    let k = class(chars[i]);
+    let a = (0..i).rev().take_while(|&j| class(chars[j]) == k).last().unwrap_or(i);
+    let b = (i..chars.len()).take_while(|&j| class(chars[j]) == k).last().map_or(i, |j| j + 1);
+    (a, b)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_selection() {
+        let v = classify(["fn main() {", "    let x = 1;", "}"].into_iter().map(String::from), false);
+        assert_eq!(sel_text(&v, Some(((0, 3), (0, 7)))).as_deref(), Some("main"));
+        assert_eq!(sel_text(&v, Some(((1, 8), (0, 10)))).as_deref(), Some("{\n    let "));
+        assert_eq!(sel_text(&v, Some(((1, 2), (1, 2)))), None);
+        assert_eq!(word_at("    let x_y = 1;", 10), (8, 11));
+        assert_eq!(word_at("ab", 9), (0, 2));
+    }
 
     #[test]
     fn branch_header() {
@@ -1776,7 +2152,7 @@ mod tests {
         let mut all = Vec::new();
         let mut frame = |events: Vec<Event>, all: &mut Vec<UiAction>| {
             let input = RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let _ = ctx.run(input, |ctx| all.extend(sb.show(ctx, &theme, &mut cfg)));
+            let _ = ctx.run(input, |ctx| all.extend(sb.show(ctx, &theme, &mut cfg, &Default::default(), &Default::default())));
         };
         for _ in 0..5 {
             frame(vec![], &mut all); // let the side panel open and lay out

@@ -53,6 +53,9 @@ fn paint_block(p: &Painter, cell: Rect, c: char, color: Color32) -> bool {
     const LL: (f32, f32, f32, f32) = (0.0, 0.5, 0.5, 1.0);
     const LR: (f32, f32, f32, f32) = (0.5, 0.5, 1.0, 1.0);
     let n = c as u32;
+    if (0x2800..=0x28FF).contains(&n) {
+        return paint_braille(p, cell, (n - 0x2800) as u8, color);
+    }
     let mut alpha = 1.0;
     let parts: &[(f32, f32, f32, f32)] = match n {
         0x2580 => &[(0.0, 0.0, 1.0, 0.5)],
@@ -86,6 +89,22 @@ fn paint_block(p: &Painter, cell: Rect, c: char, color: Color32) -> bool {
     fill(p, cell, parts, color.gamma_multiply(alpha))
 }
 
+/// Paints a Braille pattern (U+2800–U+28FF) as a 2×4 dot grid. Many fonts (including the bundled
+/// JetBrains Mono) lack these, yet CLI spinners (npm, cargo, …) use them constantly.
+fn paint_braille(p: &Painter, cell: Rect, bits: u8, color: Color32) -> bool {
+    // Bit → (column, row), per the Unicode dot numbering 1-2-3-7 (left) and 4-5-6-8 (right).
+    const DOTS: [(f32, f32); 8] = [(0., 0.), (0., 1.), (0., 2.), (1., 0.), (1., 1.), (1., 2.), (0., 3.), (1., 3.)];
+    let (o, s) = (cell.min, cell.size());
+    let r = (s.x * 0.14).min(s.y * 0.07).max(0.75);
+    for (i, &(col, row)) in DOTS.iter().enumerate() {
+        if bits & (1 << i) != 0 {
+            let center = o + vec2(s.x * (0.3 + 0.4 * col), s.y * (0.2 + 0.2 * row));
+            p.circle_filled(center, r, color);
+        }
+    }
+    true
+}
+
 fn fill(p: &Painter, cell: Rect, parts: &[(f32, f32, f32, f32)], color: Color32) -> bool {
     let (o, s) = (cell.min, cell.size());
     for &(x0, y0, x1, y1) in parts {
@@ -99,7 +118,12 @@ fn fill(p: &Painter, cell: Rect, parts: &[(f32, f32, f32, f32)], color: Color32)
 /// Per-pane animated cursor state.
 #[derive(Default)]
 pub struct CursorAnim {
-    rect: Option<Rect>,
+    /// Leading and trailing edges of the cursor shape; the tail lags to give a smear while it moves.
+    head: Option<Rect>,
+    tail: Option<Rect>,
+    /// Last target shape rect, to notice moves (which restart the blink).
+    target: Option<Rect>,
+    moved_at: f64,
 }
 
 pub struct Frame<'a> {
@@ -109,19 +133,76 @@ pub struct Frame<'a> {
     pub cell: Vec2,
     pub focused: bool,
     pub faux_bold: bool,
-    /// Smoothing factor for this frame's cursor movement (0..1).
+    /// Smoothing factors for this frame's cursor movement (0..1): leading edge, trailing edge.
     pub cursor_k: f32,
+    pub cursor_tail_k: f32,
     /// Forces this cursor shape instead of the one the program asked for.
     pub cursor_shape: Option<CursorShape>,
+    /// Seconds since start, for the blink.
+    pub time: f64,
+    pub blink: bool,
 }
 
-/// Paints the grid. Returns true while the cursor is still gliding.
+/// Solid for this long after the cursor moves, then fades in and out.
+const BLINK_HOLD: f64 = 0.6;
+const BLINK_PERIOD: f64 = 1.1;
+/// Stop blinking (stay solid) after this long without movement, to let the app go idle.
+const BLINK_TIMEOUT: f64 = 15.0;
+
+/// Cursor opacity at `t` seconds since it last moved, and seconds until the next frame is needed.
+fn blink_alpha(t: f64) -> (f32, f32) {
+    if t < BLINK_HOLD {
+        return (1.0, (BLINK_HOLD - t) as f32);
+    }
+    if t > BLINK_TIMEOUT {
+        return (1.0, f32::INFINITY);
+    }
+    let phase = ((t - BLINK_HOLD) / BLINK_PERIOD).fract();
+    let c = (phase * std::f64::consts::TAU).cos() as f32;
+    // Smoothstep around the cosine gives a plateau at both ends and a soft fade between.
+    let x = ((c + 0.6) / 1.2).clamp(0.0, 1.0);
+    let a = x * x * (3.0 - 2.0 * x);
+    // Plateaus don't need frames.
+    let next = if a == 0.0 || a == 1.0 { 1.0 / 30.0 } else { 0.0 };
+    (0.08 + 0.92 * a, next)
+}
+
+/// The rect a cursor of `shape` covers inside cell `r`.
+fn shape_rect(r: Rect, shape: CursorShape) -> Rect {
+    match shape {
+        CursorShape::Beam => Rect::from_min_size(r.min, vec2(2.0, r.height())),
+        CursorShape::Underline => Rect::from_min_max(pos2(r.min.x, r.max.y - 2.0), r.max),
+        _ => r,
+    }
+}
+
+/// Convex hull of two rects (monotone chain), clockwise in screen space.
+fn hull(a: Rect, b: Rect) -> Vec<Pos2> {
+    let mut pts: Vec<Pos2> = [a, b].iter().flat_map(|r| [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom()]).collect();
+    pts.sort_by(|p, q| p.x.total_cmp(&q.x).then(p.y.total_cmp(&q.y)));
+    let cross = |o: Pos2, a: Pos2, b: Pos2| (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    let mut h: Vec<Pos2> = Vec::with_capacity(9);
+    for pass in 0..2 {
+        let start = h.len();
+        let iter: Box<dyn Iterator<Item = &Pos2>> = if pass == 0 { Box::new(pts.iter()) } else { Box::new(pts.iter().rev()) };
+        for &p in iter {
+            while h.len() >= start + 2 && cross(h[h.len() - 2], h[h.len() - 1], p) <= 0.0 {
+                h.pop();
+            }
+            h.push(p);
+        }
+        h.pop();
+    }
+    h
+}
+
+/// Paints the grid. Returns seconds until the cursor needs another frame (0 = now, infinity = never).
 pub fn paint_terminal(
     f: &Frame,
     term: &Term<Listener>,
     glyphs: &mut GlyphCache,
     cursor_anim: &mut CursorAnim,
-) -> bool {
+) -> f32 {
     let (p, theme, cell) = (f.painter, f.theme, f.cell);
     let content = term.renderable_content();
     let offset = content.display_offset as i32;
@@ -231,40 +312,59 @@ pub fn paint_terminal(
     }
 
     // ---- cursor
-    let Some((target, glyph, cell_bg)) = cursor_cell else {
-        cursor_anim.rect = None;
-        return false;
+    let Some((cell_rect, glyph, cell_bg)) = cursor_cell else {
+        *cursor_anim = CursorAnim::default();
+        return f32::INFINITY;
     };
     let cc = c32(theme.cursor);
+    let target = shape_rect(cell_rect, cursor.shape);
     if !f.focused {
-        cursor_anim.rect = Some(target);
-        p.rect_stroke(target.shrink(0.5), 2.0, Stroke::new(1.0_f32, cc.gamma_multiply(0.7)));
-        return false;
+        *cursor_anim = CursorAnim { head: Some(target), tail: Some(target), target: Some(target), moved_at: f.time };
+        p.rect_stroke(cell_rect.shrink(0.5), 2.0, Stroke::new(1.0_f32, cc.gamma_multiply(0.7)));
+        return f32::INFINITY;
     }
 
-    let cur = lerp_rect(cursor_anim.rect.unwrap_or(target), target, f.cursor_k);
-    let arrived = (cur.min - target.min).length() < 0.5;
-    let cur = if arrived { target } else { cur };
-    cursor_anim.rect = Some(cur);
+    if cursor_anim.target != Some(target) {
+        cursor_anim.target = Some(target);
+        cursor_anim.moved_at = f.time;
+    }
+    let settle = |cur: Option<Rect>, k: f32| {
+        let r = lerp_rect(cur.unwrap_or(target), target, k);
+        if (r.min - target.min).length() + (r.max - target.max).length() < 0.5 { target } else { r }
+    };
+    let head = settle(cursor_anim.head, f.cursor_k);
+    let tail = settle(cursor_anim.tail, f.cursor_tail_k);
+    cursor_anim.head = Some(head);
+    cursor_anim.tail = Some(tail);
+    let arrived = head == target && tail == target;
+
+    let (alpha, next) = if f.blink && arrived { blink_alpha(f.time - cursor_anim.moved_at) } else { (1.0, f32::INFINITY) };
+    let col = cc.gamma_multiply(alpha);
+
+    if !arrived {
+        // Smear: the hull of the leading and trailing edges, slightly faded behind the head.
+        let trail = hull(head, tail);
+        p.add(egui::Shape::convex_polygon(trail, cc.gamma_multiply(0.55), Stroke::NONE));
+        p.rect_filled(head, 1.0, cc);
+        return 0.0;
+    }
 
     match cursor.shape {
-        CursorShape::Beam => {
-            p.rect_filled(Rect::from_min_size(cur.min, vec2(2.0, cur.height())), 1.0, cc);
-        }
-        CursorShape::Underline => {
-            p.rect_filled(Rect::from_min_max(pos2(cur.min.x, cur.max.y - 2.0), cur.max), 1.0, cc);
-        }
         CursorShape::HollowBlock => {
-            p.rect_stroke(cur.shrink(0.5), 2.0, Stroke::new(1.0_f32, cc));
+            p.rect_stroke(head.shrink(0.5), 2.0, Stroke::new(1.0_f32, col));
+        }
+        CursorShape::Beam | CursorShape::Underline => {
+            p.rect_filled(head, 1.0, col);
         }
         _ => {
-            p.rect_filled(cur, 2.0, cc);
-            if let (true, Some(i)) = (arrived, glyph) {
-                // Re-draw the glyph under the block in the cell's background color.
+            p.rect_filled(head, 2.0, col);
+            if let Some(i) = glyph {
+                // Re-draw the glyph under the block in the cell's background color, fading with the block.
                 let inv = if cell_bg == cc { c32(theme.bg) } else { cell_bg };
-                p.galley_with_override_text_color(place(&reqs[i], &galleys[i]), galleys[i].clone(), inv);
+                let g = crate::theme::lerp_color(reqs[i].color, inv, alpha);
+                p.galley_with_override_text_color(place(&reqs[i], &galleys[i]), galleys[i].clone(), g);
             }
         }
     }
-    !arrived
+    next
 }

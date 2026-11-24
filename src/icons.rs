@@ -31,6 +31,27 @@ pub enum Icon {
     Info,
     Text,
     Image,
+    FolderOpen,
+    File,
+    FileCode,
+    FileText,
+    FileConfig,
+    FileScript,
+    Archive,
+    Lock,
+    Media,
+    Font,
+    ArrowUp,
+    ArrowDown,
+    /// Outlined play triangle (the Launchpad in the rail).
+    Play,
+    /// Solid play triangle (run buttons).
+    PlaySolid,
+    Stop,
+    Pencil,
+    /// A clock with a turning-back arrow (the History view).
+    History,
+    Trash,
 }
 
 struct Pen<'a> {
@@ -57,6 +78,19 @@ impl Pen<'_> {
     fn dot(&self, x: f32, y: f32, r: f32) {
         self.p.circle_filled(self.at(x, y), r * self.s, self.stroke.color);
     }
+    fn fill(&self, pts: &[(f32, f32)], color: Color32) {
+        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| self.at(x, y)).collect();
+        self.p.add(Shape::convex_polygon(v, color, Stroke::NONE));
+    }
+    /// A closed outline (its corners join, unlike a `line` that ends where it starts).
+    fn closed(&self, pts: &[(f32, f32)]) {
+        let v: Vec<Pos2> = pts.iter().map(|&(x, y)| self.at(x, y)).collect();
+        self.p.add(Shape::closed_line(v, self.stroke));
+    }
+    /// A page with a folded corner, the base of the file icons.
+    fn page(&self) {
+        self.line(&[(9.5, 1.8), (3.5, 1.8), (3.5, 14.2), (12.5, 14.2), (12.5, 4.8), (9.5, 1.8), (9.5, 4.8), (12.5, 4.8)]);
+    }
     fn arc(&self, x: f32, y: f32, r: f32, a0: f32, a1: f32) {
         let n = 16;
         let v: Vec<Pos2> = (0..=n).map(|i| {
@@ -80,7 +114,53 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             pen.line(&[(6.3, 11.0), (10.2, 11.0)]);
         }
         Icon::Folder => {
+            pen.fill(&[(2.0, 5.5), (14.0, 5.5), (14.0, 12.5), (2.0, 12.5)], color.gamma_multiply(0.22));
             pen.line(&[(2.0, 4.0), (6.0, 4.0), (7.5, 5.5), (14.0, 5.5), (14.0, 12.5), (2.0, 12.5), (2.0, 4.0)]);
+        }
+        Icon::FolderOpen => {
+            pen.fill(&[(4.0, 7.5), (15.0, 7.5), (13.0, 12.5), (2.0, 12.5)], color.gamma_multiply(0.22));
+            pen.line(&[(2.0, 12.5), (2.0, 3.5), (6.0, 3.5), (7.5, 5.0), (12.5, 5.0), (12.5, 7.5)]);
+            pen.line(&[(2.0, 12.5), (4.0, 7.5), (15.0, 7.5), (13.0, 12.5), (2.0, 12.5)]);
+        }
+        Icon::File => pen.page(),
+        Icon::FileCode => {
+            pen.page();
+            pen.line(&[(6.8, 7.6), (5.2, 9.6), (6.8, 11.6)]);
+            pen.line(&[(9.2, 7.6), (10.8, 9.6), (9.2, 11.6)]);
+        }
+        Icon::FileText => {
+            pen.page();
+            pen.line(&[(5.6, 7.6), (10.4, 7.6)]);
+            pen.line(&[(5.6, 9.8), (10.4, 9.8)]);
+            pen.line(&[(5.6, 12.0), (8.6, 12.0)]);
+        }
+        Icon::FileConfig => {
+            // { }
+            pen.line(&[(6.2, 2.5), (5.0, 2.5), (4.3, 3.3), (4.3, 6.9), (2.8, 8.0), (4.3, 9.1), (4.3, 12.7), (5.0, 13.5), (6.2, 13.5)]);
+            pen.line(&[(9.8, 2.5), (11.0, 2.5), (11.7, 3.3), (11.7, 6.9), (13.2, 8.0), (11.7, 9.1), (11.7, 12.7), (11.0, 13.5), (9.8, 13.5)]);
+            pen.dot(8.0, 8.0, 0.9);
+        }
+        Icon::FileScript => {
+            pen.line(&[(3.0, 4.5), (7.0, 8.0), (3.0, 11.5)]);
+            pen.line(&[(8.5, 12.0), (13.5, 12.0)]);
+        }
+        Icon::Archive => {
+            pen.rect(2.5, 3.0, 13.5, 13.5, 1.6);
+            pen.line(&[(2.5, 6.0), (13.5, 6.0)]);
+            pen.line(&[(6.5, 8.6), (9.5, 8.6)]);
+        }
+        Icon::Lock => {
+            pen.rect(3.5, 7.0, 12.5, 14.0, 1.6);
+            pen.arc(8.0, 7.0, 2.8, PI, TAU);
+            pen.dot(8.0, 10.5, 1.0);
+        }
+        Icon::Media => {
+            pen.circle(8.0, 8.0, 6.0);
+            pen.fill(&[(6.6, 5.4), (11.0, 8.0), (6.6, 10.6)], color);
+        }
+        Icon::Font => {
+            pen.line(&[(3.0, 13.0), (8.0, 3.0), (13.0, 13.0)]);
+            pen.line(&[(5.0, 9.5), (11.0, 9.5)]);
         }
         Icon::Git => {
             pen.circle(5.0, 3.6, 1.6);
@@ -168,6 +248,14 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
         }
         Icon::ChevronRight => pen.line(&[(6.0, 4.0), (10.0, 8.0), (6.0, 12.0)]),
         Icon::ChevronDown => pen.line(&[(4.0, 6.0), (8.0, 10.0), (12.0, 6.0)]),
+        Icon::ArrowUp => {
+            pen.line(&[(8.0, 13.0), (8.0, 3.5)]);
+            pen.line(&[(3.8, 7.7), (8.0, 3.5), (12.2, 7.7)]);
+        }
+        Icon::ArrowDown => {
+            pen.line(&[(8.0, 3.0), (8.0, 12.5)]);
+            pen.line(&[(3.8, 8.3), (8.0, 12.5), (12.2, 8.3)]);
+        }
         Icon::Palette => {
             pen.circle(8.0, 8.0, 6.0);
             pen.dot(5.5, 6.0, 1.1);
@@ -195,6 +283,37 @@ pub fn draw(p: &Painter, icon: Icon, rect: Rect, color: Color32) {
             pen.rect(2.0, 3.0, 14.0, 13.0, 1.8);
             pen.circle(10.5, 6.3, 1.2);
             pen.line(&[(2.6, 11.8), (6.2, 7.8), (9.0, 10.6), (10.6, 9.2), (13.4, 11.8)]);
+        }
+        // Both triangles sit a little right of center, so they look centered.
+        Icon::Play => {
+            let tri = [(4.8, 2.8), (13.4, 8.0), (4.8, 13.2)];
+            pen.fill(&tri, color.gamma_multiply(0.22));
+            pen.closed(&tri);
+        }
+        Icon::PlaySolid => {
+            let v: Vec<Pos2> = [(5.0, 3.0), (13.2, 8.0), (5.0, 13.0)].iter().map(|&(x, y)| pen.at(x, y)).collect();
+            p.add(Shape::convex_polygon(v, color, Stroke::new(1.4 * s, color)));
+        }
+        Icon::Stop => {
+            p.rect_filled(Rect::from_min_max(pen.at(3.8, 3.8), pen.at(12.2, 12.2)), 2.0 * s, color);
+        }
+        Icon::Pencil => {
+            pen.closed(&[(10.8, 2.6), (13.4, 5.2), (5.8, 12.8), (2.6, 13.4), (3.2, 10.2)]);
+            pen.line(&[(9.0, 4.4), (11.6, 7.0)]);
+        }
+        Icon::History => {
+            // Around the clock from the left, through the bottom, right and top, ending at the
+            // upper left where the arrow points back.
+            pen.arc(8.0, 8.0, 6.0, -0.85 * PI, PI);
+            pen.line(&[(2.4, 2.2), (2.4, 5.5), (5.7, 5.5)]);
+            pen.line(&[(8.0, 4.9), (8.0, 8.0), (10.4, 9.4)]);
+        }
+        Icon::Trash => {
+            pen.line(&[(2.5, 4.2), (13.5, 4.2)]);
+            pen.line(&[(6.0, 4.2), (6.5, 2.2), (9.5, 2.2), (10.0, 4.2)]);
+            pen.line(&[(3.9, 4.2), (4.7, 13.8), (11.3, 13.8), (12.1, 4.2)]);
+            pen.line(&[(6.7, 6.8), (6.9, 11.4)]);
+            pen.line(&[(9.3, 6.8), (9.1, 11.4)]);
         }
     }
 }

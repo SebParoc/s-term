@@ -1,24 +1,29 @@
-//! S-term — a terminal for vibe coding.
+//! S-term — a modern terminal, written in Rust.
 //!
 //! Module map (each one is a seam for future features):
-//! - `app`    : window, tabs, pane tree, input dispatch (+ chrome, panes, palette, settings)
+//! - `app`    : window, tabs, pane tree, input dispatch (+ chrome, panes, palette, ask, settings, setup)
+//! - `assistant`: "Ask S-term" (providers, API keys, the tool-calling loop)
 //! - `config` : user settings (~/.config/s-term/config.json)
+//! - `history`: closed tabs and last sessions (~/.local/share/s-term/history.json) + the History view
 //! - `icons`  : vector line icons
 //! - `pane`   : one terminal session (PTY + alacritty_terminal state)
-//! - `layout` : the Terminator-style split tree
+//! - `layout` : the split tree
 //! - `render` : painting a terminal grid with egui
 //! - `input`  : key -> action / key -> bytes translation
 //! - `sidebar`: git changes / file tree panel + diff viewer
 //! - `theme`  : colors
-//! - `usage`  : Claude Code / Antigravity token usage + `s-term statusline`
+//! - `usage`  : Claude Code / Codex / Antigravity token usage + `s-term statusline`
 //! - `usage_ui`: the AI usage tab and tab-bar meter
 
 mod app;
+mod assistant;
 mod config;
 mod fonts;
 mod glass;
+mod history;
 mod icons;
 mod input;
+mod launchpad;
 mod layout;
 mod pane;
 mod render;

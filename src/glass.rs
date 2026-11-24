@@ -59,6 +59,12 @@ fn textured(rect: Rect, rounding: impl Into<Rounding>, tint: Color32, tex: Textu
     Shape::Rect(s)
 }
 
+/// A soft radial glow (alpha falls off to nothing at the edge of `rect`).
+pub fn glow(ctx: &Context, rect: Rect, color: Color32) -> Shape {
+    let r = rect.width().min(rect.height()) / 2.0;
+    textured(rect, r, color, textures(ctx).radial.id())
+}
+
 /// The sheen over `r`: the gradient covers a square of fixed size from the top-left corner,
 /// so wide or tall panels never get a stretched, sharp-looking band.
 fn sheen_shape(ctx: &Context, r: Rect, rounding: impl Into<Rounding>, tint: Color32) -> Shape {
@@ -69,16 +75,12 @@ fn sheen_shape(ctx: &Context, r: Rect, rounding: impl Into<Rounding>, tint: Colo
     Shape::Rect(s)
 }
 
-/// A soft radial glow (alpha falls off to nothing at the edge of `rect`).
-pub fn glow(ctx: &Context, rect: Rect, color: Color32) -> Shape {
-    let r = rect.width().min(rect.height()) / 2.0;
-    textured(rect, r, color, textures(ctx).radial.id())
-}
-
 /// How lifted a surface is: shadow strength and size.
 #[derive(Clone, Copy)]
 pub enum Lift {
     Flat,
+    /// A popup in its own OS window: a tighter shadow, so it fits a small transparent margin.
+    Float,
     High,
 }
 
@@ -87,6 +89,7 @@ pub fn shapes(ctx: &Context, r: Rect, rounding: f32, fill: Color32, theme: &Them
     let mut out = Vec::with_capacity(12);
     let (off, blur, a) = match lift {
         Lift::Flat => (0.0, 0.0, 0),
+        Lift::Float => (6.0, 18.0, 130),
         Lift::High => (18.0, 56.0, 150),
     };
     if a > 0 {
@@ -195,27 +198,33 @@ pub fn slide(ctx: &Context, id: Id, target: Rect, animate: bool) -> Rect {
     next
 }
 
+/// [`slide`] measured from `origin` (the control's own rect corner), so when the whole control
+/// moves (scrolling) the pill moves with it instantly and only animates between slots.
+pub fn slide_within(ctx: &Context, id: Id, target: Rect, origin: Pos2, animate: bool) -> Rect {
+    slide(ctx, id, target.translate(-origin.to_vec2()), animate).translate(origin.to_vec2())
+}
+
 /// The pill marking the selected item in a dock or tab strip: the same glass surface as the
 /// title bar's "Ask S-term" omnibox, so selections and the omnibox read as one family.
 pub fn pick(p: &Painter, r: Rect, theme: &Theme) {
     paint(p, r, r.height() / 2.0, theme.pick, theme, Lift::Flat);
 }
 
-/// The glossy gradient orb (the dashboard's "ask" bubble), tinted with the theme's accents.
+/// The glossy gradient orb behind the "Ask S-term" scorpion, tinted with the theme's accents.
 pub fn orb(p: &Painter, c: Pos2, r: f32, theme: &Theme) {
     let ctx = p.ctx();
     p.circle_filled(c, r + 3.0, theme.accent.gamma_multiply(0.13));
     p.add(Shadow { offset: vec2(0.0, 2.0), blur: 8.0, spread: 0.0, color: Color32::from_black_alpha(90) }.as_shape(Rect::from_center_size(c, vec2(r * 2.0, r * 2.0)), r));
-    p.circle_filled(c, r, lerp_color(theme.accent, Color32::BLACK, 0.55));
-    // Big soft accent body, lower right.
+    // Kept dark so the white scorpion on top stands out; the accents only tint the edges.
+    p.circle_filled(c, r, lerp_color(theme.accent, Color32::BLACK, 0.78));
+    // Soft accent body, lower right.
     let off = vec2(r * 0.22, r * 0.12);
     let br = r - off.length();
-    p.add(glow(ctx, Rect::from_center_size(c + off, vec2(br, br) * 2.0), theme.accent));
-    p.add(glow(ctx, Rect::from_center_size(c + off, vec2(br, br) * 2.0), lerp_color(theme.accent, Color32::WHITE, 0.35).gamma_multiply(0.6)));
-    // Cool highlight, upper left, with a white specular core.
+    p.add(glow(ctx, Rect::from_center_size(c + off, vec2(br, br) * 2.0), theme.accent.gamma_multiply(0.45)));
+    // Cool highlight, upper left.
     let off2 = vec2(-r * 0.28, -r * 0.34);
     let hr = r - off2.length();
-    p.add(glow(ctx, Rect::from_center_size(c + off2, vec2(hr, hr) * 2.0), theme.accent2));
-    p.add(glow(ctx, Rect::from_center_size(c + off2, vec2(hr, hr) * 1.0), Color32::from_white_alpha(140)));
+    p.add(glow(ctx, Rect::from_center_size(c + off2, vec2(hr, hr) * 2.0), theme.accent2.gamma_multiply(0.35)));
     p.circle_stroke(c, r - 0.4, Stroke::new(0.75_f32, Color32::from_white_alpha(90)));
 }
+

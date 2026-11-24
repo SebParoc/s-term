@@ -32,6 +32,9 @@ pub enum Action {
     BroadcastAll,
     BroadcastOff,
     ToggleSidebar,
+    /// Reopen the newest History entry.
+    ReopenClosed,
+    ShowHistory,
     OpenPalette,
     OpenSettings,
     Quit,
@@ -64,6 +67,8 @@ pub fn action_for(key: Key, m: Modifiers) -> Option<Action> {
             Key::Q => Some(Quit),
             Key::X => Some(ToggleZoom),
             Key::B => Some(ToggleSidebar),
+            Key::R => Some(ReopenClosed),
+            Key::H => Some(ShowHistory),
             Key::N => Some(NewWindow),
             Key::P => Some(OpenPalette),
             Key::Tab => Some(PrevTab),

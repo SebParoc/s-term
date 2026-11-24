@@ -7,6 +7,7 @@ use alacritty_terminal::event_loop::{EventLoop, Msg, Notifier};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::vte::ansi::CursorShape;
 use alacritty_terminal::tty;
 
 pub type PaneId = u64;
@@ -91,7 +92,12 @@ impl Pane {
         let child_pid = pty.child().id();
 
         let listener = Listener { id, tx, ctx };
-        let term = Arc::new(FairMutex::new(Term::new(Config { scrolling_history: scrollback, ..Config::default() }, &size, listener.clone())));
+        let term = Arc::new(FairMutex::new(Term::new(Config {
+                scrolling_history: scrollback,
+                // Shown in "Auto" cursor mode when the program doesn't ask for a shape.
+                default_cursor_style: alacritty_terminal::vte::ansi::CursorStyle { shape: CursorShape::Beam, blinking: false },
+                ..Config::default()
+            }, &size, listener.clone())));
 
         let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let notifier = Notifier(event_loop.channel());
@@ -132,6 +138,104 @@ impl Pane {
         std::fs::read_link(format!("/proc/{}/cwd", self.child_pid)).ok()
     }
 
+    /// The program in the foreground of this pane: its name, and whether it is the shell itself
+    /// (i.e. the pane is idle at a prompt).
+    pub fn foreground(&self) -> (String, bool) {
+        let comm = |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).map(|s| s.trim_end().to_string()).unwrap_or_default();
+        match self.foreground_pgid() {
+            Some(pg) => {
+                let name = comm(pg);
+                if name.is_empty() {
+                    (comm(self.child_pid), true)
+                } else {
+                    (name, false)
+                }
+            }
+            None => (comm(self.child_pid), true),
+        }
+    }
+
+    /// The process group in the foreground of the terminal when it isn't the shell's own: the
+    /// program running in this pane (its group leader's pid).
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        // /proc/<pid>/stat: "pid (comm) state ppid pgrp session tty_nr tpgid ..."; comm may contain spaces.
+        let tpgid = std::fs::read_to_string(format!("/proc/{}/stat", self.child_pid))
+            .ok()
+            .and_then(|s| s.rsplit_once(')').map(|(_, rest)| rest.to_string()))
+            .and_then(|rest| rest.split_whitespace().nth(5).and_then(|t| t.parse::<i64>().ok()))?;
+        (tpgid > 0 && tpgid as u32 != self.child_pid).then_some(tpgid as u32)
+    }
+
+    /// The shell is in the foreground and nothing is typed at its prompt: the text before the
+    /// cursor ends in a prompt character (❯ $ # % >) and nothing follows the cursor.
+    /// A heuristic (there is no prompt marker to go by); when unsure it says no.
+    pub fn at_empty_prompt(&self) -> bool {
+        use alacritty_terminal::index::Column;
+        if !self.foreground().1 {
+            return false;
+        }
+        let term = self.term.lock();
+        let grid = term.grid();
+        let cur = grid.cursor.point;
+        let row = &grid[cur.line];
+        let cols = grid.columns();
+        let text = |a: usize, b: usize| (a..b).map(|c| row[Column(c)].c).collect::<String>();
+        let col = cur.column.0.min(cols);
+        let before = text(0, col);
+        let after = text(col, cols);
+        after.trim().is_empty() && before.trim_end().ends_with(['❯', '$', '#', '%', '>'])
+    }
+
+    /// The last `max_lines` lines of the pane (scrollback included), as plain text with trailing
+    /// blank lines removed.
+    pub fn text_tail(&self, max_lines: usize) -> String {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+        let term = self.term.lock();
+        let grid = term.grid();
+        let history = grid.history_size() as i32;
+        let screen = grid.screen_lines() as i32;
+        let cols = grid.columns();
+        let mut lines: Vec<String> = Vec::new();
+        for l in -history..screen {
+            let row = &grid[Line(l)];
+            let mut s = String::with_capacity(cols);
+            for c in 0..cols {
+                let cell = &row[Column(c)];
+                if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                s.push(cell.c);
+                if let Some(zw) = cell.zerowidth() {
+                    s.extend(zw);
+                }
+            }
+            let wrapped = row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
+            let s = s.trim_end().to_string();
+            match lines.last_mut() {
+                Some(prev) if prev.ends_with('\u{0}') => {
+                    prev.pop();
+                    prev.push_str(&s);
+                }
+                _ => lines.push(s),
+            }
+            if wrapped {
+                if let Some(last) = lines.last_mut() {
+                    last.push('\u{0}');
+                }
+            }
+        }
+        for l in &mut lines {
+            if l.ends_with('\u{0}') {
+                l.pop();
+            }
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        let start = lines.len().saturating_sub(max_lines);
+        lines[start..].join("\n")
+    }
 }
 
 impl Drop for Pane {

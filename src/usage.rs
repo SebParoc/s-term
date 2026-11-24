@@ -119,6 +119,7 @@ pub struct Snapshot {
     pub daily: Arc<Daily>,
     pub claude: ToolStats,
     pub agy: ToolStats,
+    pub codex: ToolStats,
     pub limits: Option<Limits>,
     /// `s-term statusline` has written at least once (the hook is set up).
     pub statusline_seen: bool,
@@ -716,6 +717,156 @@ impl AgyScanner {
     }
 }
 
+
+// ------------------------------------------------------------------------------------------- Codex
+
+/// One Codex rollout file (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`).
+#[derive(Default)]
+struct CodexFile {
+    offset: u64,
+    recs: Vec<Rec>,
+    model: Option<Arc<str>>,
+    cwd: Option<String>,
+    /// Running total from the last token_count event (repeats of it are skipped).
+    last_total: u64,
+    context_window: Option<u64>,
+}
+
+#[derive(Default)]
+struct CodexScanner {
+    files: HashMap<PathBuf, CodexFile>,
+    models: HashMap<String, Arc<str>>,
+}
+
+impl CodexScanner {
+    fn root() -> PathBuf {
+        std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".codex"))
+    }
+
+    fn scan(&mut self, now: i64) -> bool {
+        let root = Self::root();
+        if !root.is_dir() {
+            return false;
+        }
+        let mut found = Vec::new();
+        find_jsonl(&root.join("sessions"), 4, &mut found);
+        let mut seen = HashSet::new();
+        for p in found {
+            if mtime_secs(&p).is_some_and(|t| t >= now - KEEP_SECS) {
+                self.update(&p);
+                seen.insert(p);
+            }
+        }
+        self.files.retain(|p, _| seen.contains(p));
+        true
+    }
+
+    fn update(&mut self, path: &Path) {
+        let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let f = self.files.entry(path.to_path_buf()).or_default();
+        if len < f.offset {
+            *f = CodexFile::default();
+        }
+        if len == f.offset {
+            return;
+        }
+        let Ok(mut file) = std::fs::File::open(path) else { return };
+        if file.seek(SeekFrom::Start(f.offset)).is_err() {
+            return;
+        }
+        let mut buf = Vec::new();
+        if file.take(256 * 1024 * 1024).read_to_end(&mut buf).is_err() {
+            return;
+        }
+        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return };
+        for line in buf[..end].split(|&b| b == b'\n') {
+            Self::line(&mut self.models, f, line);
+        }
+        f.offset += end as u64 + 1;
+    }
+
+    fn line(models: &mut HashMap<String, Arc<str>>, f: &mut CodexFile, line: &[u8]) {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { return };
+        // Newer rollouts wrap each item as {timestamp, type, payload}.
+        let (kind, p) = match v.get("payload") {
+            Some(p) => (v["type"].as_str().unwrap_or(""), p),
+            None => (v["type"].as_str().unwrap_or(""), &v),
+        };
+        match kind {
+            "session_meta" => f.cwd = p["cwd"].as_str().map(String::from),
+            "turn_context" => {
+                if let Some(m) = p["model"].as_str() {
+                    f.model = Some(models.entry(m.to_string()).or_insert_with(|| Arc::from(m)).clone());
+                }
+                if f.cwd.is_none() {
+                    f.cwd = p["cwd"].as_str().map(String::from);
+                }
+            }
+            "event_msg" if p["type"] == "token_count" => {
+                let info = &p["info"];
+                if info.is_null() {
+                    return;
+                }
+                let total = info["total_token_usage"]["total_tokens"].as_u64().unwrap_or(0);
+                if total == 0 || total == f.last_total {
+                    return;
+                }
+                f.last_total = total;
+                if let Some(w) = info["model_context_window"].as_u64() {
+                    f.context_window = Some(w);
+                }
+                let u = &info["last_token_usage"];
+                let g = |k: &str| u[k].as_u64().unwrap_or(0);
+                let cached = g("cached_input_tokens");
+                let model = f.model.clone().unwrap_or_else(|| models.entry("codex".into()).or_insert_with(|| Arc::from("codex")).clone());
+                f.recs.push(Rec {
+                    ts: v["timestamp"].as_str().and_then(parse_ts).unwrap_or(0),
+                    model,
+                    // OpenAI counts cached tokens inside input_tokens.
+                    input: g("input_tokens").saturating_sub(cached),
+                    output: g("output_tokens"),
+                    cache_read: cached,
+                    cache_write: 0,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn stats(&self, now: i64, focus: Option<&Path>) -> ToolStats {
+        let mut st = tool_stats(self.files.values().map(|f| f.recs.as_slice()), now);
+        let want = focus.map(|f| f.to_string_lossy().into_owned());
+        let mut best: Option<(&CodexFile, i64, bool)> = None;
+        for f in self.files.values() {
+            let Some(last) = f.recs.iter().map(|r| r.ts).max() else { continue };
+            if last < now - LIVE_SECS {
+                continue;
+            }
+            let here = want.is_some() && f.cwd == want;
+            if best.is_none_or(|(_, t, h)| (here, last) > (h, t)) {
+                best = Some((f, last, here));
+            }
+        }
+        if let Some((f, last, here)) = best {
+            let latest = f.recs.iter().max_by_key(|r| r.ts).unwrap();
+            let ctx = latest.context();
+            let label = f.cwd.as_deref().and_then(|c| Path::new(c).file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into());
+            st.live = Some(Live {
+                label,
+                model: latest.model.clone(),
+                context_tokens: ctx,
+                context_size: f.context_window,
+                context_pct: f.context_window.filter(|w| *w > 0).map(|w| ctx as f32 / w as f32 * 100.0),
+                last_ts: last,
+                requests: f.recs.len() as u32,
+                totals: aggregate(f.recs.iter()),
+                here,
+            });
+        }
+        st
+    }
+}
+
 // ------------------------------------------------------------------------------------------- worker
 
 pub struct Usage {
@@ -737,6 +888,7 @@ impl Usage {
             .spawn(move || {
                 let mut claude = ClaudeScanner::default();
                 let mut agy = AgyScanner::default();
+                let mut codex = CodexScanner::default();
                 let mut ledger = Ledger::load();
                 loop {
                     let now = now_secs();
@@ -748,10 +900,18 @@ impl Usage {
                     c.installed = claude_installed;
                     let mut a = agy.stats(now, focus.as_deref());
                     a.installed = agy_installed;
-                    let procs = running_procs(&["claude", "agy"]);
-                    (c.running, a.running) = (procs[0], procs[1]);
+                    let codex_installed = codex.scan(now);
+                    let mut x = codex.stats(now, focus.as_deref());
+                    x.installed = codex_installed;
+                    let procs = running_procs(&["claude", "agy", "codex"]);
+                    (c.running, a.running, x.running) = (procs[0], procs[1], procs[2]);
                     let fresh = daily_from(
-                        claude.files.values().flat_map(|f| f.recs.iter()).chain(agy.convs.values().flat_map(|c| c.recs.iter())),
+                        claude
+                            .files
+                            .values()
+                            .flat_map(|f| f.recs.iter())
+                            .chain(agy.convs.values().flat_map(|c| c.recs.iter()))
+                            .chain(codex.files.values().flat_map(|f| f.recs.iter())),
                     );
                     ledger.merge(&fresh);
                     let snap = Snapshot {
@@ -760,6 +920,7 @@ impl Usage {
                         daily: ledger.shared.clone(),
                         claude: c,
                         agy: a,
+                        codex: x,
                         limits: newest.as_ref().map(limits_from),
                         statusline_seen: seen,
                     };
@@ -824,9 +985,11 @@ pub fn report_main() {
     let (status, newest, _) = read_status_files(now);
     let mut claude = ClaudeScanner::default();
     let mut agy = AgyScanner::default();
+    let mut codex = CodexScanner::default();
     let tools = [
         ("Claude Code", claude.scan(now).then(|| claude.stats(now, focus.as_deref(), &status))),
         ("Antigravity", agy.scan(now).then(|| agy.stats(now, focus.as_deref()))),
+        ("Codex", codex.scan(now).then(|| codex.stats(now, focus.as_deref()))),
     ];
     for (name, st) in tools {
         let Some(st) = st else {
@@ -853,6 +1016,29 @@ pub fn report_main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_token_counts() {
+        let mut models = HashMap::new();
+        let mut f = CodexFile::default();
+        let lines = [
+            r#"{"timestamp":"2026-11-23T10:00:00Z","type":"session_meta","payload":{"cwd":"/home/u/proj"}}"#,
+            r#"{"timestamp":"2026-11-23T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5-codex"}}"#,
+            r#"{"timestamp":"2026-11-23T10:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1200},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":200},"model_context_window":272000}}}"#,
+            // Repeated with the same total: skipped.
+            r#"{"timestamp":"2026-11-23T10:00:06Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1200},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":200}}}}"#,
+            r#"{"timestamp":"2026-11-23T10:00:07Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#,
+        ];
+        for l in lines {
+            CodexScanner::line(&mut models, &mut f, l.as_bytes());
+        }
+        assert_eq!(f.recs.len(), 1);
+        let r = &f.recs[0];
+        assert_eq!((&*r.model, r.input, r.cache_read, r.output), ("gpt-5-codex", 400, 600, 200));
+        assert_eq!(r.context(), 1000);
+        assert_eq!(f.context_window, Some(272000));
+        assert_eq!(f.cwd.as_deref(), Some("/home/u/proj"));
+    }
 
     #[test]
     fn timestamps() {

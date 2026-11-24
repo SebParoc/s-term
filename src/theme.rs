@@ -66,6 +66,7 @@ pub const PRESETS: &[(&str, &str)] = &[
     ("aurora", "Aurora"),
     ("graphite", "Graphite"),
     ("atelier", "Atelier"),
+    ("full-moon", "Full Moon"),
 ];
 
 impl Theme {
@@ -110,6 +111,11 @@ impl Theme {
             "atelier" => Self::build("atelier", 0x1c1512, 0xf6e9da, 0xff9177, 0xff9177, 0x75dac0, [
                 0x2e2420, 0xff8a70, 0x75dac0, 0xf1be58, 0x9fb7d9, 0xe1a6c9, 0x8fd3c9, 0xe5d5c7,
                 0x6b5a50, 0xffab98, 0x9be8d3, 0xf6d28a, 0xbccde6, 0xecc0da, 0xaee3db, 0xfff6e9,
+            ]),
+            // Moonlight on charcoal: white and grayscale, keeping only a soft red/green for diffs and errors.
+            "full-moon" => Self::build("full-moon", 0x0e0e0f, 0xd6d6d6, 0xf5f5f5, 0xf0f0f0, 0xa8a8a8, [
+                0x1e1e1e, 0xe07a7a, 0x8fcf94, 0xe8e8e8, 0x8f8f8f, 0xbababa, 0xc4c4c4, 0xd6d6d6,
+                0x5c5c5c, 0xeb9b9b, 0xa9dcad, 0xf4f4f4, 0xa8a8a8, 0xcccccc, 0xd8d8d8, 0xffffff,
             ]),
             "midnight" => Self::build("midnight", 0x0b0e14, 0xbfbdb6, 0xe6b450, 0x59c2ff, 0x95e6cb, [
                 0x131721, 0xf07178, 0xaad94c, 0xffb454, 0x59c2ff, 0xd2a6ff, 0x95e6cb, 0xbfbdb6,

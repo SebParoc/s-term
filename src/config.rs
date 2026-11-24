@@ -31,14 +31,62 @@ pub enum PromptPrefix {
     HostFolder,
 }
 
+/// Which API the "Ask S-term" assistant talks to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum AiProvider {
+    #[default]
+    Anthropic,
+    #[serde(rename = "openai")]
+    OpenAi,
+    Gemini,
+}
+
+impl AiProvider {
+    pub const ALL: [AiProvider; 3] = [AiProvider::Anthropic, AiProvider::OpenAi, AiProvider::Gemini];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AiProvider::Anthropic => "Anthropic",
+            AiProvider::OpenAi => "OpenAI",
+            AiProvider::Gemini => "Gemini",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "kebab-case")]
 pub enum CursorStyle {
-    /// Whatever the running program asks for.
+    /// Whatever the running program asks for; a thin bar when it asks for nothing.
     App,
     Block,
     Beam,
     Underline,
+}
+
+/// Where a launcher runs its commands.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RunIn {
+    #[default]
+    Tab,
+    /// A new pane to the right of the focused one.
+    Split,
+    /// The focused pane when it's idle at a prompt, otherwise a new tab.
+    Here,
+}
+
+/// A saved series of commands that the Launchpad runs with one click.
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
+#[serde(default)]
+pub struct Launcher {
+    pub id: u64,
+    pub name: String,
+    /// The folder the commands run in (`~` allowed). Empty = the focused pane's folder.
+    pub dir: String,
+    /// Run in order, each only if the one before it succeeded.
+    pub commands: Vec<String>,
+    pub run_in: RunIn,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
@@ -50,10 +98,14 @@ pub struct Config {
     pub font_size: f32,
     pub line_height: f32,
     pub cursor_glide: bool,
+    /// The cursor fades in and out while idle.
+    pub cursor_blink: bool,
     pub animations: bool,
     pub pane_headers: PaneHeaders,
     pub dim_inactive: bool,
     pub system_titlebar: bool,
+    /// Minimize and maximize buttons next to close in S-term's own title bar.
+    pub window_buttons: bool,
     pub status_bar: bool,
     pub copy_on_select: bool,
     pub scrollback: usize,
@@ -61,6 +113,7 @@ pub struct Config {
     pub shell: String,
     pub show_claude: bool,
     pub show_antigravity: bool,
+    pub show_codex: bool,
     pub heat_metric: HeatMetric,
     /// Ctrl+= / Ctrl+- / Ctrl+wheel scale the whole interface instead of the terminal text.
     pub zoom_ui: bool,
@@ -80,6 +133,28 @@ pub struct Config {
     pub hide_ignored: bool,
     /// Open the side panel when S-term starts.
     pub panel_on_start: bool,
+    /// The first-run setup screen has been completed (or skipped).
+    pub setup_done: bool,
+    /// "Ask S-term": which provider, and the model picked for each one (empty = pick automatically).
+    pub ai_provider: AiProvider,
+    pub ai_model_anthropic: String,
+    pub ai_model_openai: String,
+    pub ai_model_gemini: String,
+    /// Run the assistant's commands without asking first.
+    pub ai_auto_run: bool,
+    /// The Launchpad's saved command sequences, in the order shown.
+    pub launchers: Vec<Launcher>,
+    /// Keep closed tabs and the last session in the History view (`~/.local/share/s-term/history.json`).
+    pub keep_history: bool,
+    /// Reopen the last session at startup. Off: a popup offers it until something is typed.
+    pub restore_session: bool,
+}
+
+impl Config {
+    /// Whether any AI tool's usage is tracked (Claude, Antigravity or Codex).
+    pub fn any_ai_tool(&self) -> bool {
+        self.show_claude || self.show_antigravity || self.show_codex
+    }
 }
 
 impl Default for Config {
@@ -90,20 +165,23 @@ impl Default for Config {
             font_size: 14.0,
             line_height: 1.08,
             cursor_glide: true,
+            cursor_blink: true,
             animations: true,
             pane_headers: PaneHeaders::Splits,
             dim_inactive: true,
             system_titlebar: false,
+            window_buttons: true,
             status_bar: true,
             copy_on_select: false,
             scrollback: 10_000,
             shell: String::new(),
-            show_claude: true,
-            show_antigravity: true,
+            show_claude: false,
+            show_antigravity: false,
+            show_codex: false,
             heat_metric: HeatMetric::Output,
             zoom_ui: false,
             ui_scale: 1.0,
-            prompt: PromptPrefix::None,
+            prompt: PromptPrefix::HostFolder,
             cursor_style: CursorStyle::App,
             scroll_speed: 1.0,
             new_tab_home: false,
@@ -111,11 +189,36 @@ impl Default for Config {
             show_hidden: true,
             hide_ignored: false,
             panel_on_start: false,
+            setup_done: false,
+            ai_provider: AiProvider::Anthropic,
+            ai_model_anthropic: "claude-opus-5-5".into(),
+            ai_model_openai: String::new(),
+            ai_model_gemini: String::new(),
+            ai_auto_run: false,
+            launchers: Vec::new(),
+            keep_history: true,
+            restore_session: false,
         }
     }
 }
 
 impl Config {
+    pub fn ai_model(&self, p: AiProvider) -> &str {
+        match p {
+            AiProvider::Anthropic => &self.ai_model_anthropic,
+            AiProvider::OpenAi => &self.ai_model_openai,
+            AiProvider::Gemini => &self.ai_model_gemini,
+        }
+    }
+
+    pub fn ai_model_mut(&mut self, p: AiProvider) -> &mut String {
+        match p {
+            AiProvider::Anthropic => &mut self.ai_model_anthropic,
+            AiProvider::OpenAi => &mut self.ai_model_openai,
+            AiProvider::Gemini => &mut self.ai_model_gemini,
+        }
+    }
+
     pub fn path() -> PathBuf {
         let base = std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -127,7 +230,7 @@ impl Config {
     pub fn load() -> Self {
         let raw: Option<serde_json::Value> = std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok());
         let mut c: Config = raw.clone().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-        if let Some(v) = raw.filter(|v| v.get("prompt").is_none()) {
+        if let Some(v) = raw.filter(|v| v.get("prompt").is_none() && (v.get("prompt_dir").is_some() || v.get("prompt_user").is_some())) {
             c.prompt = Self::legacy_prompt(&v);
         }
         c.font_size = c.font_size.clamp(6.0, 48.0);
@@ -191,7 +294,9 @@ mod tests {
         assert_eq!(c.font_size, 16.0);
         assert!(c.cursor_glide);
         assert_eq!(c.pane_headers, PaneHeaders::Splits);
-        assert_eq!(c.prompt, PromptPrefix::None);
+        assert_eq!(c.prompt, PromptPrefix::HostFolder);
+        assert!(c.window_buttons);
+        assert!(!c.show_claude && !c.show_codex && !c.show_antigravity);
         assert!(c.explorer_folders.is_empty());
     }
 
@@ -209,5 +314,17 @@ mod tests {
         let c = Config { explorer_folders: vec![PathBuf::from("/tmp/a"), PathBuf::from("/srv/b")], ..Config::default() };
         let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back.explorer_folders, c.explorer_folders);
+    }
+
+    #[test]
+    fn launchers_load_with_defaults() {
+        let c: Config = serde_json::from_str(r#"{"launchers":[{"name":"web","commands":["npm install","npm run dev"]},{"id":7,"run_in":"split"}]}"#).unwrap();
+        assert_eq!(c.launchers.len(), 2);
+        assert_eq!(c.launchers[0].commands, ["npm install", "npm run dev"]);
+        assert_eq!((c.launchers[0].run_in, c.launchers[0].dir.as_str()), (RunIn::Tab, ""));
+        assert_eq!((c.launchers[1].id, c.launchers[1].run_in), (7, RunIn::Split));
+        assert!(Config::default().launchers.is_empty());
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.launchers, c.launchers);
     }
 }

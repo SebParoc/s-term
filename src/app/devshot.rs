@@ -1,4 +1,4 @@
-//! Developer aid: `S_TERM_SCREENSHOT=out.png [S_TERM_DEMO=ai,split,settings,palette,files,folder=/some/dir] s-term`
+//! Developer aid: `S_TERM_SCREENSHOT=out.png [S_TERM_DEMO=ai,split,settings,palette,files,launch,folder=/some/dir] s-term`
 //! sets up the requested views, saves a screenshot of the window as PNG and exits.
 
 use std::path::PathBuf;
@@ -75,6 +75,18 @@ fn write_png(path: &std::path::Path, w: usize, h: usize, rgba: &[u8]) -> std::io
     std::fs::write(path, out)
 }
 
+/// Sample launchers for screenshots (the config is never saved in screenshot mode).
+fn demo_launchers() -> Vec<crate::config::Launcher> {
+    use crate::config::{Launcher, RunIn};
+    let here = std::env::current_dir().map(|d| crate::launchpad::tilde(&d)).unwrap_or_default();
+    let l = |id, name: &str, dir: &str, cmds: &[&str], run_in| Launcher { id, name: name.into(), dir: dir.into(), commands: cmds.iter().map(|c| c.to_string()).collect(), run_in };
+    vec![
+        l(1, "Dev server", &here, &["npm install", "npm run dev"], RunIn::Tab),
+        l(2, "Release build", &here, &["cargo build --release", "./scripts/install.sh"], RunIn::Tab),
+        l(3, "Ping localhost", "", &["ping -i 2 127.0.0.1"], RunIn::Split),
+    ]
+}
+
 impl STerm {
     pub(super) fn devshot(&mut self, ctx: &egui::Context) {
         let Some(mut d) = self.devshot.take() else { return };
@@ -86,8 +98,38 @@ impl STerm {
                     "ai" => self.sidebar.show_view(View::Ai),
                     "changes" => self.sidebar.show_view(View::Changes),
                     "files" => self.sidebar.show_view(View::Files),
+                    "launch" => self.sidebar.show_view(View::Launch),
+                    "history" => self.sidebar.show_view(View::History),
+                    // Sample History entries (in memory), and the startup popup with `restoreoffer`.
+                    "historydemo" => {
+                        self.history_demo(false);
+                        self.sidebar.show_view(View::History);
+                    }
+                    "restoreoffer" => self.history_demo(true),
+                    "launchdemo" => {
+                        self.config.launchers = demo_launchers();
+                        self.sidebar.show_view(View::Launch);
+                    }
+                    "launchnew" => {
+                        let cwd = self.focused_cwd();
+                        self.sidebar.new_launcher(cwd);
+                    }
+                    // Runs the harmless sample launcher (a ping in a split); needs `launchdemo` first.
+                    "launchrun" => self.launch_op(3, crate::launchpad::Op::Run),
                     "settings" => self.settings_open = true,
                     "palette" => self.palette.toggle(),
+                    "setup" => self.setup = Some(Default::default()),
+                    s if s.starts_with("setup=") => self.setup = Some(super::setup::Setup::at(s[6..].parse().unwrap_or(0))),
+                    "ask" => {
+                        self.ask_demo();
+                        self.palette.open_ask();
+                    }
+                    "commands" => self.palette.show_commands(),
+                    s if s.starts_with("asktyped=") => {
+                        self.palette.open_commands();
+                        self.palette.ask_first = true;
+                        self.palette.set_query(&s[9..]);
+                    }
                     "split" => self.do_action(Action::SplitSideBySide, ctx),
                     "splitdown" => self.do_action(Action::SplitStacked, ctx),
                     "tab" => self.do_action(Action::NewTab, ctx),

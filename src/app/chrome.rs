@@ -18,9 +18,10 @@ const WINDOW_ROUND: f32 = 12.0;
 enum Act {
     StartDrag,
     ToggleMax,
+    Minimize,
     Close,
     Settings,
-    Palette,
+    Ask,
     NewTab,
     Select(usize),
     CloseTab(usize),
@@ -40,6 +41,21 @@ pub(super) fn paint_logo(p: &egui::Painter, tex: egui::TextureId, r: Rect, theme
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(0, 2, 3);
     p.add(Shape::mesh(mesh));
+}
+
+/// The scorpion in one flat color.
+pub(super) fn paint_glyph(p: &egui::Painter, tex: egui::TextureId, r: Rect, color: Color32) {
+    let mut mesh = Mesh::with_texture(tex);
+    mesh.add_rect_with_uv(r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), color);
+    p.add(Shape::mesh(mesh));
+}
+
+/// The "Ask S-term" badge: the glossy orb with the scorpion on it.
+pub(super) fn ask_badge(p: &egui::Painter, tex: egui::TextureId, c: egui::Pos2, r: f32, theme: &Theme) {
+    glass::orb(p, c, r, theme);
+    let g = Rect::from_center_size(c, vec2(r * 1.75, r * 1.75));
+    paint_glyph(p, tex, g.translate(vec2(0.0, 0.8)), Color32::from_black_alpha(90));
+    paint_glyph(p, tex, g, Color32::WHITE);
 }
 
 fn window_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, theme: &Theme, danger: bool, id: &str) -> bool {
@@ -106,9 +122,20 @@ impl STerm {
             match a {
                 Act::StartDrag => ctx.send_viewport_cmd(ViewportCommand::StartDrag),
                 Act::ToggleMax => ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized)),
+                Act::Minimize => ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
                 Act::Close => ctx.send_viewport_cmd(ViewportCommand::Close),
                 Act::Settings => self.settings_open = !self.settings_open,
-                Act::Palette => self.palette.toggle(),
+                Act::Ask => {
+                    if self.palette.open {
+                        self.palette.open = false;
+                    } else if self.ask.history.is_empty() && !self.ask.busy() {
+                        self.palette.open_commands();
+                        self.palette.ask_first = self.ask.has_key(self.config.ai_provider);
+                    } else {
+                        self.palette.open_ask();
+                        self.ask.focus_input = true;
+                    }
+                }
                 Act::NewTab => self.new_tab(),
                 Act::Select(i) => self.active = i.min(self.tabs.len().saturating_sub(1)),
                 Act::CloseTab(i) => self.close_tab(i),
@@ -133,6 +160,9 @@ impl STerm {
         let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
         let resizing = self.frame_resizing;
         let mut acts = Vec::new();
+        let mut plus_rect = Rect::NOTHING;
+        // Tabs running a Launchpad launcher show its name.
+        let launched: Vec<Option<String>> = self.tabs.iter().map(|t| self.launched(t.focus).map(String::from)).collect();
         let theme = &self.theme;
 
         egui::TopBottomPanel::top("s-term-title")
@@ -162,7 +192,17 @@ impl STerm {
                     if window_button(ui, mk(x), Icon::Close, theme, true, "s-term-wc-close") {
                         acts.push(Act::Close);
                     }
-                    // Only a close button: double-click the title bar to maximize.
+                    if self.config.window_buttons {
+                        x -= w;
+                        let max_icon = if maximized { Icon::Restore } else { Icon::Maximize };
+                        if window_button(ui, mk(x), max_icon, theme, false, "s-term-wc-max") {
+                            acts.push(Act::ToggleMax);
+                        }
+                        x -= w;
+                        if window_button(ui, mk(x), Icon::Minimize, theme, false, "s-term-wc-min") {
+                            acts.push(Act::Minimize);
+                        }
+                    }
                     x -= w + 6.0;
                 } else {
                     x -= 8.0;
@@ -174,21 +214,24 @@ impl STerm {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let start = ui.cursor().max.x;
-                        if icons::button(ui, Icon::Gear, 30.0, theme.muted, theme.header_focused, self.settings_open, Id::new("s-term-tb-gear"))
-                            .on_hover_text("Settings (Ctrl+,)")
-                            .clicked()
-                        {
-                            acts.push(Act::Settings);
-                        }
                         // Command palette "omnibox".
                         let wide = bar.width() > 980.0;
                         let (pr, presp) = ui.allocate_exact_size(vec2(if wide { 270.0 } else { 32.0 }, 32.0), CLICK);
                         let ph = ui.ctx().animate_bool_with_time(Id::new("s-term-tb-pal"), presp.hovered() || self.palette.open, 0.12);
                         glass::paint(&p, pr, 16.0, lerp_color(theme.glass, theme.header_focused, ph), theme, Lift::Flat);
+                        let can_ask = self.ask.has_key(self.config.ai_provider) || !self.ask.history.is_empty() || self.ask.busy();
                         if wide {
-                            glass::orb(&p, pos2(pr.min.x + 16.0, pr.center().y), 10.0, theme);
+                            ask_badge(&p, self.logo.id(), pos2(pr.min.x + 16.0, pr.center().y), 10.0, theme);
                             // The prompt types itself in when the window opens.
-                            let full = "Ask S-term for a command…";
+                            let full = if self.ask.needs_attention() {
+                                "S-term is waiting for your OK"
+                            } else if self.ask.busy() {
+                                "S-term is working…"
+                            } else if can_ask {
+                                "Ask S-term…"
+                            } else {
+                                "Search…"
+                            };
                             let age = ui.input(|i| i.time) as f32;
                             let n = ((age - 0.25).max(0.0) / 0.026) as usize;
                             let shown: String = full.chars().take(n).collect();
@@ -198,10 +241,10 @@ impl STerm {
                             p.text(pos2(pr.min.x + 33.0, pr.center().y), Align2::LEFT_CENTER, shown, FontId::proportional(12.0), lerp_color(theme.muted, theme.text, 0.35 + 0.65 * ph));
                             icons::draw(&p, Icon::Search, icons::center_rect(pos2(pr.max.x - 17.0, pr.center().y), 13.0), theme.muted);
                         } else {
-                            glass::orb(&p, pr.center(), 10.0, theme);
+                            ask_badge(&p, self.logo.id(), pr.center(), 10.0, theme);
                         }
-                        if presp.on_hover_text("Command palette (Ctrl+Shift+P)").clicked() {
-                            acts.push(Act::Palette);
+                        if presp.on_hover_text(if can_ask { "Ask S-term, or search commands (Ctrl+Shift+P)" } else { "Search commands and settings (Ctrl+Shift+P)" }).clicked() {
+                            acts.push(Act::Ask);
                         }
                         right_used = start - ui.cursor().max.x;
                     });
@@ -214,7 +257,11 @@ impl STerm {
                 let titles: Vec<String> = self
                     .tabs
                     .iter()
-                    .map(|t| self.panes.get(&t.focus).map(|p| tab_title(&p.title).to_string()).unwrap_or_default())
+                    .zip(&launched)
+                    .map(|(t, name)| match name {
+                        Some(name) => name.clone(),
+                        None => self.panes.get(&t.focus).map(|p| tab_title(&p.title).to_string()).unwrap_or_default(),
+                    })
                     .collect();
                 let ideal: Vec<f32> = titles.iter().map(|t| (p.layout_no_wrap(t.clone(), font.clone(), Color32::WHITE).size().x + 70.0).clamp(130.0, 240.0)).collect();
                 let gap = 4.0;
@@ -252,12 +299,23 @@ impl STerm {
                         tab.root.leaves(&mut v);
                         v.len()
                     };
-                    let icon = if tab.broadcast { Icon::Broadcast } else if panes > 1 { Icon::SplitRight } else { Icon::Terminal };
+                    let icon = if tab.broadcast {
+                        Icon::Broadcast
+                    } else if launched[i].is_some() {
+                        Icon::Play
+                    } else if panes > 1 {
+                        Icon::SplitRight
+                    } else {
+                        Icon::Terminal
+                    };
                     icons::draw(&p, icon, icons::center_rect(pos2(r.min.x + 18.0, r.center().y), 14.0), lerp_color(theme.muted, theme.pick_ink, on));
                     let lit = hover.max(on);
                     let clip = p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - if lit > 0.05 { 28.0 } else { 10.0 }, r.max.y)));
                     let ink = lerp_color(lerp_color(theme.muted, theme.text, hover), theme.pick_ink, on);
-                    clip.text(pos2(r.min.x + 33.0, r.center().y), Align2::LEFT_CENTER, &titles[i], font.clone(), ink);
+                    // Long titles (usually paths) lose their *start*, keeping the tail visible;
+                    // the full title is in the tooltip. Fixed close-button reserve so text doesn't jump on hover.
+                    let shown = elide_left(&p, &titles[i], &font, r.max.x - 28.0 - (r.min.x + 33.0));
+                    clip.text(pos2(r.min.x + 33.0, r.center().y), Align2::LEFT_CENTER, shown, font.clone(), ink);
                     if lit > 0.05 {
                         if xresp.hovered() {
                             p.rect_filled(xr, 10.0, if active { theme.pick_ink.gamma_multiply(0.12) } else { theme.header_focused });
@@ -285,14 +343,24 @@ impl STerm {
                     }
                 }
                 let plus = Rect::from_min_size(pos2(tx - 1.0, bar.center().y - 14.0), vec2(28.0, 28.0));
+                plus_rect = plus;
                 let presp = ui.interact(plus, Id::new("s-term-tab-plus"), CLICK);
-                let ph = ui.ctx().animate_bool_with_time(Id::new("s-term-tab-plus-h"), presp.hovered(), 0.12);
-                p.rect_filled(plus, 14.0, theme.header_focused.gamma_multiply(ph));
-                icons::draw(&p, Icon::Plus, icons::center_rect(plus.center(), 14.0), lerp_color(theme.muted, theme.text, ph));
-                if presp.on_hover_text("New tab (Ctrl+Shift+T)").clicked() {
+                // Something dragged over "+" (from the Explorer or the desktop): drop opens a tab there.
+                let dragging = self.sidebar.dragging().is_some() || ui.input(|i| !i.raw.hovered_files.is_empty());
+                let over = dragging && ui.input(|i| i.pointer.latest_pos()).is_some_and(|q| plus.expand(4.0).contains(q));
+                let dh = ui.ctx().animate_bool_with_time(Id::new("s-term-tab-plus-drop"), over, 0.12);
+                let ph = ui.ctx().animate_bool_with_time(Id::new("s-term-tab-plus-h"), presp.hovered(), 0.12).max(dh);
+                p.rect_filled(plus, 14.0, lerp_color(theme.header_focused.gamma_multiply(ph), theme.accent.gamma_multiply(0.25), dh));
+                if dh > 0.01 {
+                    p.rect_stroke(plus.shrink(0.5), 14.0, egui::Stroke::new(1.5_f32, theme.accent.gamma_multiply(dh)));
+                }
+                icons::draw(&p, Icon::Plus, icons::center_rect(plus.center(), 14.0), lerp_color(lerp_color(theme.muted, theme.text, ph), theme.accent, dh));
+                let tip = if dragging { "Drop to open a new tab here" } else { "New tab (Ctrl+Shift+T)" };
+                if presp.on_hover_text(tip).clicked() {
                     acts.push(Act::NewTab);
                 }
             });
+        self.plus_rect = plus_rect;
         self.apply_acts(ctx, acts, maximized);
     }
 
@@ -303,6 +371,14 @@ impl STerm {
         let mut acts = Vec::new();
         let changes = self.sidebar.snapshot().and_then(|s| s.git.as_ref().map(|g| g.changes.len())).unwrap_or(0);
         let usage = self.sidebar.usage.snapshot();
+        // With no AI tools tracked, the AI usage view has nothing to show.
+        let ai_tools = self.config.any_ai_tool();
+        let launching = self.any_launch_busy();
+        if !ai_tools && self.sidebar.view() == View::Ai {
+            let open = self.sidebar.open;
+            self.sidebar.show_view(View::Files);
+            self.sidebar.open = open;
+        }
         egui::SidePanel::left("s-term-rail")
             .exact_width(RAIL_W)
             .resizable(false)
@@ -311,11 +387,16 @@ impl STerm {
             .show(ctx, |ui| {
                 let r = ui.max_rect();
                 let p = ui.painter().clone();
-                let items = [
+                let items: Vec<_> = [
                     (View::Files, Icon::Files, "Explorer"),
                     (View::Changes, Icon::Git, "Source control"),
+                    (View::Launch, Icon::Play, "Launchpad"),
+                    (View::History, Icon::History, "History (Ctrl+Shift+H)"),
                     (View::Ai, Icon::Sparkle, "AI usage"),
-                ];
+                ]
+                .into_iter()
+                .filter(|(v, ..)| *v != View::Ai || ai_tools)
+                .collect();
                 let slot = |y: f32| Rect::from_center_size(pos2(r.center().x, y + 18.0), vec2(36.0, 36.0));
                 let y0 = r.min.y + 8.0;
                 // A light pill glides to the open view.
@@ -350,6 +431,9 @@ impl STerm {
                         p.rect_filled(badge, 7.0, theme.accent);
                         p.galley(pos2(badge.min.x + 4.0, badge.center().y - g.size().y / 2.0), g, theme.bar);
                     }
+                    if view == View::Launch && launching {
+                        p.circle_filled(pos2(br.max.x - 6.0, br.min.y + 6.0), 3.5, c32(theme.palette[2]));
+                    }
                     if view == View::Ai {
                         if let Some(l) = usage.as_ref().filter(|u| u.claude.running).and_then(|u| u.claude.live.as_ref()).filter(|l| l.here) {
                             if let Some(pct) = l.context_pct.or_else(|| l.context_size.map(|s| l.context_tokens as f32 / s as f32 * 100.0)) {
@@ -380,7 +464,7 @@ impl STerm {
         let theme = &self.theme;
         let snap = self.sidebar.snapshot();
         let usage = self.sidebar.usage.snapshot();
-        let show_agy = self.config.show_antigravity;
+        let cfg = self.config.clone();
         let mut acts = Vec::new();
         let (panes, broadcast, grid) = match self.tab() {
             Some(t) => {
@@ -437,7 +521,7 @@ impl STerm {
                             status_item(ui, theme, Some(Icon::Broadcast), "broadcasting", theme.accent2, Id::new("s-term-st-bc"));
                         }
                         if let Some(u) = &usage {
-                            if usage_ui::status_meter(ui, theme, u, show_agy, STATUS_H - 6.0).is_some_and(|r| r.clicked()) {
+                            if usage_ui::status_meter(ui, theme, u, &cfg, STATUS_H - 6.0).is_some_and(|r| r.clicked()) {
                                 acts.push(Act::View(View::Ai));
                             }
                         }
@@ -502,5 +586,28 @@ impl STerm {
         let r = ctx.screen_rect();
         p.rect_stroke(r.shrink(0.5), rounding, Stroke::new(1.0_f32, lerp_color(self.theme.border, self.theme.rim, 0.5)));
         glass::paint_rim(&p, r, rounding, &self.theme, 1.2);
+    }
+}
+
+/// Trim `text` from the left (prefixing "…") until it fits in `max_w` pixels.
+fn elide_left(p: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
+    let width = |t: &str| p.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
+    if width(text) <= max_w {
+        return text.to_string();
+    }
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    // Binary search for the smallest cut that fits.
+    let (mut lo, mut hi) = (1, starts.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if width(&format!("…{}", &text[starts[mid]..])) <= max_w {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    match starts.get(lo) {
+        Some(&b) => format!("…{}", &text[b..]),
+        None => "…".to_string(),
     }
 }
