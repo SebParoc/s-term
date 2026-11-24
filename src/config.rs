@@ -142,6 +142,8 @@ pub struct Config {
     pub ai_model_gemini: String,
     /// Run the assistant's commands without asking first.
     pub ai_auto_run: bool,
+    /// The Ask popup's size as the user last resized it (the panel, not its shadow); 0 = default.
+    pub ask_size: [f32; 2],
     /// The Launchpad's saved command sequences, in the order shown.
     pub launchers: Vec<Launcher>,
     /// Keep closed tabs and the last session in the History view (`~/.local/share/s-term/history.json`).
@@ -195,6 +197,7 @@ impl Default for Config {
             ai_model_openai: String::new(),
             ai_model_gemini: String::new(),
             ai_auto_run: false,
+            ask_size: [0.0, 0.0],
             launchers: Vec::new(),
             keep_history: true,
             restore_session: false,

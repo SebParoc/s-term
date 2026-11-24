@@ -807,6 +807,7 @@ impl eframe::App for STerm {
             self.settings_page(ctx);
         }
         self.ask_tick(ctx);
+        self.ask_keep_size(ctx);
         if self.palette.open {
             self.palette_ui(ctx);
         } else {

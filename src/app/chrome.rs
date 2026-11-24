@@ -554,12 +554,7 @@ impl STerm {
             (_, _, _, true) => ResizeDirection::South,
             _ => return,
         };
-        ctx.set_cursor_icon(match dir {
-            ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
-            ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
-            ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
-            _ => CursorIcon::ResizeVertical,
-        });
+        ctx.set_cursor_icon(resize_cursor(dir));
         if ctx.input(|i| i.pointer.primary_pressed()) {
             ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
             self.frame_resizing = true;
@@ -609,5 +604,15 @@ fn elide_left(p: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> Strin
     match starts.get(lo) {
         Some(&b) => format!("…{}", &text[b..]),
         None => "…".to_string(),
+    }
+}
+
+/// The pointer shape for resizing from an edge or corner.
+pub(super) fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
+    match dir {
+        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
+        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
+        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
+        _ => CursorIcon::ResizeVertical,
     }
 }

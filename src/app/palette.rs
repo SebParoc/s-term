@@ -9,6 +9,26 @@ use crate::input::{Action, Dir};
 use crate::sidebar::Tab as View;
 use crate::theme::{lerp_color, PRESETS};
 
+/// The Ask panel's default and smallest sizes (the glass, without its shadow margin).
+const ASK_DEFAULT: egui::Vec2 = vec2(760.0, 500.0);
+const ASK_MIN: egui::Vec2 = vec2(520.0, 280.0);
+
+/// Which edge or corner of `r` a point on its rim is nearest (corners reach 20 px along each side).
+fn edge_dir(r: Rect, p: egui::Pos2) -> egui::ResizeDirection {
+    use egui::ResizeDirection as R;
+    let c = 20.0;
+    match (p.x < r.min.x + c, p.x > r.max.x - c, p.y < r.min.y + c, p.y > r.max.y - c) {
+        (true, _, true, _) => R::NorthWest,
+        (_, true, true, _) => R::NorthEast,
+        (true, _, _, true) => R::SouthWest,
+        (_, true, _, true) => R::SouthEast,
+        (true, ..) => R::West,
+        (_, true, ..) => R::East,
+        (_, _, true, _) => R::North,
+        _ => R::South,
+    }
+}
+
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Fuzzy command search, with "Ask S-term" as one of the results.
@@ -32,8 +52,18 @@ pub struct Palette {
     commands_open: bool,
     /// How far the Ask popup was dragged from its default spot.
     pub ask_offset: egui::Vec2,
-    /// The Ask popup's size last frame, to keep it centered as it grows (and to size its window).
+    /// The Ask panel's size after the user resized it this session (zero = `config.ask_size`, else
+    /// the default). It never follows the content: a long conversation scrolls inside it.
     ask_size: egui::Vec2,
+    /// When `ask_size` last changed, to save it to the config once it settles.
+    ask_size_dirty: Option<std::time::Instant>,
+    /// The size its window was opened with. Kept as is while the window is open, so egui never
+    /// sends a resize that fights the user's.
+    ask_win_size: egui::Vec2,
+    /// The user resized the open window, so its size is theirs to keep.
+    ask_user_resized: bool,
+    /// The edge being dragged (the popup inside the main window).
+    ask_grip: Option<egui::ResizeDirection>,
     /// The Ask popup is its own OS window this frame (so it can leave the S-term window).
     pub ask_windowed: bool,
     /// It was on screen last frame (false = it opens fresh this frame).
@@ -275,6 +305,85 @@ impl STerm {
         }
     }
 
+    /// The Ask panel's size: the one the user picked (this session, else saved), else the default,
+    /// fitted into `room`.
+    fn ask_panel_size(&self, room: egui::Vec2) -> egui::Vec2 {
+        let saved = vec2(self.config.ask_size[0], self.config.ask_size[1]);
+        let s = if self.palette.ask_size.x > 0.0 { self.palette.ask_size } else if saved.x > 0.0 { saved } else { ASK_DEFAULT };
+        s.min(room).max(ASK_MIN)
+    }
+
+    /// Takes a size the user dragged the panel to.
+    fn ask_note_size(&mut self, s: egui::Vec2) {
+        if (s - self.palette.ask_size).length() > 0.5 {
+            self.palette.ask_size = s;
+            self.palette.ask_size_dirty = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Saves the panel's size once a resize has settled (a window manager resize has no "done" event).
+    pub(super) fn ask_keep_size(&mut self, ctx: &egui::Context) {
+        let Some(t) = self.palette.ask_size_dirty else { return };
+        let wait = std::time::Duration::from_millis(500);
+        if t.elapsed() < wait {
+            ctx.request_repaint_after(wait - t.elapsed() + std::time::Duration::from_millis(20));
+            return;
+        }
+        let s = self.palette.ask_size.round();
+        self.config.ask_size = [s.x, s.y];
+        self.palette.ask_size_dirty = None;
+    }
+
+    /// The glass panel at a fixed `rect`, with the conversation inside.
+    fn ask_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &crate::theme::Theme, rect: Rect, lift: crate::glass::Lift) {
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+            crate::glass::frame(ui, theme, 22.0, theme.elevated, lift, 12.0, |ui| {
+                let inner = rect.shrink(12.0);
+                ui.set_width(inner.width());
+                ui.set_height(inner.height());
+                // Anything still too wide (or the one frame before the input's height is known)
+                // stays inside the glass.
+                ui.set_clip_rect(ui.clip_rect().intersect(rect));
+                self.ask_view(ui, ctx, theme);
+            });
+        });
+    }
+
+    /// Grab strips along the panel's edges (a few px either side). In its own window, a press hands
+    /// the resize to the window manager; inside S-term, returns the edge being dragged and how far.
+    fn ask_grips(&mut self, ui: &egui::Ui, ctx: &egui::Context, r: Rect, windowed: bool) -> Option<(egui::ResizeDirection, egui::Vec2)> {
+        let (o, i) = (6.0, 5.0);
+        let out = r.expand(o);
+        let strips = [
+            Rect::from_min_max(out.min, pos2(out.max.x, r.min.y + i)),
+            Rect::from_min_max(pos2(out.min.x, r.max.y - i), out.max),
+            Rect::from_min_max(pos2(out.min.x, r.min.y + i), pos2(r.min.x + i, r.max.y - i)),
+            Rect::from_min_max(pos2(r.max.x - i, r.min.y + i), pos2(out.max.x, r.max.y - i)),
+        ];
+        // The window manager takes the pointer mid-press, so the window only watches for hovers.
+        let sense = if windowed { Sense::hover() } else { super::DRAG };
+        let mut moved = None;
+        for (k, s) in strips.into_iter().enumerate() {
+            let resp = ui.interact(s, Id::new(("s-term-ask-grip", k)), sense);
+            if resp.drag_started() {
+                self.palette.ask_grip = ctx.input(|i| i.pointer.press_origin()).map(|p| edge_dir(r, p));
+            }
+            let dir = if resp.dragged() { self.palette.ask_grip } else { resp.hover_pos().map(|p| edge_dir(r, p)) };
+            let Some(dir) = dir else { continue };
+            ctx.set_cursor_icon(super::chrome::resize_cursor(dir));
+            if windowed && ctx.input(|i| i.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+                self.palette.ask_user_resized = true;
+            } else if resp.dragged() {
+                moved = Some((dir, resp.drag_delta()));
+            }
+            if resp.drag_stopped() {
+                self.palette.ask_grip = None;
+            }
+        }
+        moved
+    }
+
     /// The Ask popup as its own borderless, always-on-top window, free to move anywhere on the
     /// desktop. Falls back to `ask_popup` inside the main window when that isn't possible.
     fn ask_window(&mut self, ctx: &egui::Context) {
@@ -284,24 +393,26 @@ impl STerm {
             return;
         }
         let theme = crate::theme::Theme::preset(&self.config.theme);
-        let width = 760.0_f32;
-        let size = if self.palette.ask_size.x > 0.0 { self.palette.ask_size } else { vec2(width + PAD.left + PAD.right, 220.0) };
         let main = ctx.input(|i| i.viewport().outer_rect);
         if !self.palette.ask_shown {
-            self.palette.ask_open_pos = self.palette.ask_last_pos.or_else(|| main.map(|r| pos2(r.center().x - size.x / 2.0, r.min.y + 52.0)));
+            // Opening: the user's size (or the default), fitted to the monitor.
+            let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(ctx.screen_rect().size() + vec2(200.0, 200.0));
+            self.palette.ask_win_size = self.ask_panel_size(monitor - PAD.sum() - vec2(40.0, 120.0)) + PAD.sum();
+            self.palette.ask_user_resized = false;
+            let w = self.palette.ask_win_size.x;
+            self.palette.ask_open_pos = self.palette.ask_last_pos.or_else(|| main.map(|r| pos2(r.center().x - w / 2.0, r.min.y + 52.0)));
         }
         self.palette.ask_shown = true;
-        let monitor_h = ctx.input(|i| i.viewport().monitor_size.map(|m| m.y)).unwrap_or(ctx.screen_rect().height() + 200.0);
-        let max_h = (monitor_h - 420.0).clamp(140.0, 560.0);
         let mut b = egui::ViewportBuilder::default()
             .with_title("Ask S-term")
             .with_app_id("s-term")
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(false)
+            .with_resizable(true)
             .with_taskbar(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_inner_size(size);
+            .with_inner_size(self.palette.ask_win_size)
+            .with_min_inner_size(ASK_MIN + PAD.sum());
         if let Some(p) = self.palette.ask_open_pos {
             b = b.with_position(p);
         }
@@ -312,21 +423,12 @@ impl STerm {
                 return;
             }
             egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
-                let r = egui::Frame::none()
-                    .inner_margin(PAD)
-                    .show(ui, |ui| {
-                        crate::glass::frame(ui, &theme, 22.0, theme.elevated, crate::glass::Lift::Float, 12.0, |ui| {
-                            ui.set_width(width - 24.0);
-                            ui.set_max_width(width - 24.0);
-                            self.ask_view(ui, ctx, &theme, max_h);
-                        });
-                    })
-                    .response
-                    .rect;
-                let new = vec2(r.width().ceil(), r.height().ceil());
-                if new != self.palette.ask_size {
-                    self.palette.ask_size = new;
-                    ctx.request_repaint();
+                // The panel fills the window (less the shadow margin), whatever size it is.
+                let panel = ctx.screen_rect() - PAD;
+                self.ask_panel(ui, ctx, &theme, panel, crate::glass::Lift::Float);
+                self.ask_grips(ui, ctx, panel, true);
+                if self.palette.ask_user_resized {
+                    self.ask_note_size(panel.size());
                 }
             });
             if ctx.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) {
@@ -345,14 +447,13 @@ impl STerm {
     fn ask_popup(&mut self, ctx: &egui::Context) {
         let theme = crate::theme::Theme::preset(&self.config.theme);
         let screen = ctx.screen_rect();
-        let width = (screen.width() - 40.0).min(760.0);
-        // Centered on its real size (wide content can make it grow past `width`), plus wherever
-        // it was dragged; kept on screen so the header can always be grabbed again.
-        let size = if self.palette.ask_size.x > 0.0 { self.palette.ask_size } else { vec2(width, 0.0) };
+        let room = vec2(screen.width() - 40.0, screen.height() - 80.0);
+        let size = self.ask_panel_size(room);
+        // Centered, plus wherever it was dragged; kept on screen so the header can always be
+        // grabbed again.
         let mut pos = pos2(screen.center().x - size.x / 2.0, screen.min.y + 64.0) + self.palette.ask_offset;
         pos.x = pos.x.clamp(screen.min.x + 80.0 - size.x, (screen.max.x - 80.0).max(screen.min.x));
         pos.y = pos.y.clamp(screen.min.y, (screen.max.y - 48.0).max(screen.min.y));
-        let max_h = (screen.height() - 330.0).clamp(140.0, 520.0);
         let mut close = false;
         egui::Area::new(Id::new("s-term-palette-backdrop")).order(egui::Order::Middle).fixed_pos(screen.min).show(ctx, |ui| {
             let (r, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
@@ -362,14 +463,32 @@ impl STerm {
                 close = true;
             }
         });
-        let area = egui::Area::new(Id::new("s-term-palette")).order(egui::Order::Foreground).fixed_pos(pos).show(ctx, |ui| {
-            crate::glass::frame(ui, &theme, 22.0, theme.elevated, crate::glass::Lift::High, 12.0, |ui| {
-                ui.set_width(width - 24.0);
-                ui.set_max_width(width - 24.0);
-                self.ask_view(ui, ctx, &theme, max_h);
-            });
+        let mut grip = None;
+        egui::Area::new(Id::new("s-term-palette")).order(egui::Order::Foreground).fixed_pos(pos).constrain(false).show(ctx, |ui| {
+            let rect = Rect::from_min_size(pos, size);
+            self.ask_panel(ui, ctx, &theme, rect, crate::glass::Lift::High);
+            grip = self.ask_grips(ui, ctx, rect, false);
         });
-        self.palette.ask_size = area.response.rect.size();
+        // Dragging an edge moves only that edge (the popup is centered, so the offset makes up half).
+        if let Some((dir, d)) = grip {
+            use egui::ResizeDirection as R;
+            let (w, e) = (matches!(dir, R::West | R::NorthWest | R::SouthWest), matches!(dir, R::East | R::NorthEast | R::SouthEast));
+            let (n, s) = (matches!(dir, R::North | R::NorthWest | R::NorthEast), matches!(dir, R::South | R::SouthWest | R::SouthEast));
+            let max = room.max(ASK_MIN);
+            let mut new = size;
+            if e || w {
+                new.x = (size.x + if e { d.x } else { -d.x }).clamp(ASK_MIN.x, max.x);
+                let grew = new.x - size.x;
+                self.palette.ask_offset.x += if e { grew / 2.0 } else { -grew / 2.0 };
+            }
+            if n || s {
+                new.y = (size.y + if s { d.y } else { -d.y }).clamp(ASK_MIN.y, max.y);
+                if n {
+                    self.palette.ask_offset.y -= new.y - size.y;
+                }
+            }
+            self.ask_note_size(new);
+        }
         if close {
             self.palette.open = false;
         }

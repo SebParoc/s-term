@@ -437,7 +437,7 @@ impl STerm {
     // ------------------------------------------------------------------------------------------ UI
 
     /// The conversation view inside the popup.
-    pub(super) fn ask_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &Theme, max_h: f32) {
+    pub(super) fn ask_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, theme: &Theme) {
         let p = self.config.ai_provider;
         // An ongoing conversation stays visible even if its key was removed.
         let has_key = keys::get(p).is_some() || !self.ask.history.is_empty();
@@ -501,10 +501,21 @@ impl STerm {
         }
 
         // ---- conversation
+        // The panel has a fixed size: the conversation scrolls in whatever the approval box, the
+        // input and the hint line leave (their height is measured each frame, see the end).
+        let below_id = Id::new("s-term-ask-below");
+        let below = ctx.data(|d| d.get_temp::<f32>(below_id)).unwrap_or(64.0);
+        let conv_h = (ui.available_height() - below).max(40.0);
         let mut insert: Option<String> = None;
         let shown_any = !self.ask.history.is_empty() || self.ask.error.is_some() || self.ask.busy();
-        if shown_any {
-            egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).stick_to_bottom(true).show(ui, |ui| {
+        if !shown_any {
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), conv_h), Sense::hover());
+            let c = r.center();
+            super::chrome::ask_badge(ui.painter(), self.logo.id(), c - vec2(0.0, 18.0), 16.0, theme);
+            let line = "Ask about your panes, or tell S-term what to run.";
+            ui.painter().text(c + vec2(0.0, 12.0), egui::Align2::CENTER_TOP, line, FontId::proportional(13.0), theme.muted);
+        } else {
+            egui::ScrollArea::vertical().id_salt("s-term-ask-conv").max_height(conv_h).min_scrolled_height(conv_h).auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
                 ui.add_space(6.0);
                 let results: HashMap<&str, &ToolResult> = self
                     .ask
@@ -564,6 +575,8 @@ impl STerm {
             });
         }
 
+        let below_top = ui.cursor().top();
+
         // ---- approval
         let mut decision: Option<bool> = None;
         if let Some(pend) = &mut self.ask.pending {
@@ -588,7 +601,7 @@ impl STerm {
                     if ui.button("Skip").clicked() {
                         decision = Some(false);
                     }
-                    ui.label(RichText::new("Settings → Assistant can run commands without asking.").size(10.5).color(theme.muted));
+                    ui.add(egui::Label::new(RichText::new("Settings → Assistant can run commands without asking.").size(10.5).color(theme.muted)).truncate());
                 });
             });
             let (enter, ctrl_enter) = ctx.input_mut(|i| (i.consume_key(Modifiers::NONE, Key::Enter), i.consume_key(Modifiers::CTRL, Key::Enter)));
@@ -663,6 +676,11 @@ impl STerm {
         ui.add_space(4.0);
         let mode = if self.config.ai_auto_run { "commands run without asking" } else { "you approve each command" };
         ui.label(RichText::new(format!("⏎ send   esc close   ·   {mode}")).size(10.5).color(theme.muted));
+        let used = ui.cursor().top() - below_top;
+        if (used - below).abs() > 0.5 {
+            ctx.data_mut(|d| d.insert_temp(below_id, used));
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -677,7 +695,7 @@ fn user_bubble(ui: &mut egui::Ui, theme: &Theme, text: &str) {
             .inner_margin(egui::Margin::symmetric(12.0, 7.0))
             .show(ui, |ui| {
                 ui.set_max_width(ui.available_width() * 0.78);
-                ui.label(RichText::new(text).size(13.5).color(theme.text));
+                ui.add(egui::Label::new(RichText::new(text).size(13.5).color(theme.text)).wrap());
             });
     });
     ui.add_space(8.0);
@@ -746,11 +764,15 @@ fn tool_row(ui: &mut egui::Ui, theme: &Theme, call: &ToolCall, result: Option<&T
         Some(r) if r.is_error => ("failed", c32(theme.palette[1])),
         Some(_) => ("✓", c32(theme.palette[2])),
     };
-    ui.horizontal(|ui| {
-        let (r, _) = ui.allocate_exact_size(vec2(16.0, 18.0), Sense::hover());
+    // One wrapping block after the icon, so a long command never widens the panel.
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    job.append(&assistant::describe(call), 0.0, TextFormat { font_id: FontId::proportional(12.0), color: theme.text.gamma_multiply(0.8), ..Default::default() });
+    job.append(mark, 8.0, TextFormat { font_id: FontId::proportional(11.0), color: col, ..Default::default() });
+    ui.horizontal_top(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::hover());
         icons::draw(ui.painter(), Icon::Terminal, icons::center_rect(r.center(), 12.0), theme.muted);
-        let resp = ui.label(RichText::new(assistant::describe(call)).size(12.0).color(theme.text.gamma_multiply(0.8)));
-        ui.label(RichText::new(mark).size(11.0).color(col));
+        let resp = ui.add(egui::Label::new(job).wrap());
         if let Some(r) = result.filter(|r| r.is_error) {
             resp.on_hover_text(&r.content);
         }

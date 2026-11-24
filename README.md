@@ -126,7 +126,8 @@ without focus can be dimmed. Both are in Settings → Appearance.
 Click **Ask S-term** in the title bar and type a question or a task, like "why did my build fail?", "what's using
 port 8080?" or "open a pane on the right and start the dev server". The same box searches commands, so it doubles as
 the [command palette](#command-palette). The conversation opens in its own small window that stays on top and can be
-moved anywhere, so you can keep using the terminal while the assistant works.
+moved anywhere, so you can keep using the terminal while the assistant works. Drag its header to move it, and drag an
+edge or corner to resize it. It keeps that size (saved across restarts), and a long conversation scrolls inside it.
 
 The assistant sees your tabs and panes and the last lines of the focused pane, and it has tools to:
 
