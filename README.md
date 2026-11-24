@@ -1,4 +1,4 @@
-# ⚡ S-term
+# ⚡🦂 S-term
 
 A modern terminal for Linux, written in Rust.
 
