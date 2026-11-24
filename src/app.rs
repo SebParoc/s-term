@@ -107,6 +107,8 @@ pub struct STerm {
     launch_checked: Option<Instant>,
     /// Closed tabs and the last session (the History view).
     hist: history::HistState,
+    /// A V press or a Paste event arrived since the last V release (see `handle_keyboard`).
+    v_seen: bool,
 }
 
 impl STerm {
@@ -167,6 +169,7 @@ impl STerm {
             launch_status: Default::default(),
             launch_checked: None,
             hist: Default::default(),
+            v_seen: false,
         };
         if app.config.zoom_ui {
             ctx.set_zoom_factor(app.config.ui_scale);
@@ -559,6 +562,18 @@ impl STerm {
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
         let (events, mods) = ctx.input(|i| (i.events.clone(), i.modifiers));
+        // egui-winit swallows a Ctrl+V press whole and sends a Paste event only when the clipboard
+        // has text, so with just an image on it (a screenshot) nothing arrives and Claude Code never
+        // gets its Ctrl+V. The V release still comes through: one with no press or Paste before it
+        // is that Ctrl+V. (Tracked here, before the modal check, so the pairs stay in step.)
+        let mut image_ctrl_v = false;
+        for ev in &events {
+            match ev {
+                egui::Event::Key { key: Key::V, pressed: true, .. } | egui::Event::Paste(_) => self.v_seen = true,
+                egui::Event::Key { key: Key::V, pressed: false, modifiers, .. } => image_ctrl_v |= !std::mem::take(&mut self.v_seen) && !modifiers.shift,
+                _ => {}
+            }
+        }
         // So does a text field in the side panel (it reports this from the last frame).
         if self.modal_open() || self.sidebar.typing() {
             // Overlays own the keyboard: Esc closes the top one, nothing reaches the shell.
@@ -587,6 +602,9 @@ impl STerm {
                 }
             }
             return;
+        }
+        if image_ctrl_v {
+            self.send_input(vec![0x16]);
         }
         let mut suppress_text = false;
         for ev in events {
