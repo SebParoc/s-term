@@ -702,85 +702,29 @@ fn idle_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), nam
     p.text(pos2(r.min.x + 44.0, r.center().y), Align2::LEFT_CENTER, format!("{name}  ·  {when}"), FontId::proportional(11.5), theme.muted);
 }
 
-/// One row of the plan-limits grid: a tool (or one of Antigravity's model groups) and its limits.
-struct LimitLine {
-    icon: fn(&Painter, Pos2, f32),
-    name: String,
-    /// What the tooltip calls it ("Antigravity · Gemini models").
-    full: String,
-    five_hour: Option<Limit>,
-    weekly: Option<Limit>,
-    updated: i64,
-}
-
-/// The plan-limits grid's columns across `r`: the name, then a 5-hour and a weekly cell.
-fn limit_cols(r: Rect) -> [Rect; 3] {
-    let name_w = (r.width() * 0.33).clamp(84.0, 120.0);
-    let gap = 14.0;
-    let cell = (r.width() - name_w - 2.0 * gap) / 2.0;
-    let col = |x: f32, w: f32| Rect::from_min_max(pos2(x, r.min.y), pos2(x + w, r.max.y));
-    [col(r.min.x, name_w), col(r.min.x + name_w + gap, cell), col(r.max.x - cell, cell)]
-}
-
-/// The grid's heading: the section's title, with the column names over the cells.
-fn limits_heading(ui: &mut egui::Ui, theme: &Theme) {
-    ui.add_space(18.0);
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-    let [name, five, week] = limit_cols(r);
-    let (p, font, col) = (ui.painter(), FontId::proportional(10.5), theme.muted.gamma_multiply(0.9));
-    for (c, t) in [(name, "PLAN LIMITS"), (five, "5-HOUR"), (week, "WEEKLY")] {
-        p.text(pos2(c.min.x, r.center().y), Align2::LEFT_CENTER, t, font.clone(), col);
-    }
-    ui.add_space(6.0);
-}
-
-/// A row of the grid: icon and name, then each limit's percentage, time to reset and bar. Hover
-/// for the details and when they were read.
-fn limit_line(ui: &mut egui::Ui, theme: &Theme, l: &LimitLine, now: i64) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
-    let [name, five, week] = limit_cols(r);
+fn limit_row(ui: &mut egui::Ui, theme: &Theme, label: &str, l: &Limit, now: i64) {
+    let color = level_color(l.pct, theme);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
     let p = ui.painter();
-    let y = r.min.y + 9.0;
-    // A group with nothing used (0% and no reset under way) recedes.
-    let unused = [l.five_hour, l.weekly].iter().flatten().all(|x| x.at(now).pct < 0.5 && x.at(now).resets_at.is_none());
-    (l.icon)(p, pos2(name.min.x + 6.0, y), 4.6);
-    p.with_clip_rect(name).text(pos2(name.min.x + 17.0, y), Align2::LEFT_CENTER, &l.name, FontId::proportional(11.5), if unused { theme.muted } else { theme.text });
-    for (cell, lim) in [(five, l.five_hour), (week, l.weekly)] {
-        let Some(lim) = lim.map(|x| x.at(now)) else {
-            p.text(pos2(cell.min.x, y), Align2::LEFT_CENTER, "–", FontId::proportional(11.5), theme.muted.gamma_multiply(0.6));
-            continue;
-        };
-        let color = if lim.pct < 0.5 { theme.muted } else { level_color(lim.pct, theme) };
-        p.text(pos2(cell.min.x, y), Align2::LEFT_CENTER, format!("{:.0}%", lim.pct), FontId::proportional(12.0), color);
-        if let Some(t) = lim.resets_at {
-            p.text(pos2(cell.max.x, y), Align2::RIGHT_CENTER, duration(t - now), FontId::proportional(10.5), theme.muted);
-        }
-        thin_bar(p, Rect::from_min_max(pos2(cell.min.x, r.max.y - 9.0), pos2(cell.max.x, r.max.y - 6.0)), lim.pct / 100.0, color, theme);
+    let y = r.min.y + 8.0;
+    let g = p.layout_no_wrap(label.to_string(), FontId::proportional(11.5), theme.muted);
+    let lw = g.size().x;
+    p.galley(pos2(r.min.x, y - g.size().y / 2.0), g, theme.muted);
+    p.text(pos2(r.min.x + lw + 8.0, y), Align2::LEFT_CENTER, format!("{:.0}%", l.pct), FontId::proportional(12.0), color);
+    if let Some(t) = l.resets_at {
+        p.text(pos2(r.max.x, y), Align2::RIGHT_CENTER, format!("resets in {}", duration(t - now)), FontId::proportional(10.5), theme.muted);
     }
-    resp.on_hover_ui(|ui| {
-        ui.label(RichText::new(&l.full).strong());
-        for (w, lim) in [("5-hour", l.five_hour), ("Weekly", l.weekly)] {
-            if let Some(lim) = lim.map(|x| x.at(now)) {
-                let reset = lim.resets_at.map(|t| format!(", resets in {}", duration(t - now))).unwrap_or_default();
-                ui.label(format!("{w} limit: {:.0}% used{reset}", lim.pct));
-            }
-        }
-        ui.label(RichText::new(format!("Updated {}", ago(now, l.updated))).size(11.0).color(theme.muted));
-    });
+    thin_bar(p, Rect::from_min_max(pos2(r.min.x, r.max.y - 6.0), pos2(r.max.x, r.max.y - 2.0)), l.pct / 100.0, color, theme);
 }
 
-/// Claude Code's row while its limits are unknown: why, in place of the cells.
-fn limit_missing(ui: &mut egui::Ui, theme: &Theme, seen: bool) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-    let [name, five, _] = limit_cols(r);
+/// A tool's icon and name over its plan-limit rows, and when they were read.
+fn limits_head(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, updated: Option<i64>, now: i64) {
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 20.0), Sense::hover());
     let p = ui.painter();
-    let y = r.center().y;
-    claude_icon(p, pos2(name.min.x + 6.0, y), 4.6);
-    p.with_clip_rect(name).text(pos2(name.min.x + 17.0, y), Align2::LEFT_CENTER, "Claude Code", FontId::proportional(11.5), theme.text);
-    let msg = if seen { "after its next reply" } else { "needs the status line" };
-    p.text(pos2(five.min.x, y), Align2::LEFT_CENTER, msg, FontId::proportional(11.0), theme.muted);
-    if !seen {
-        resp.on_hover_text("Set Claude Code's statusLine to `s-term statusline` to see your 5-hour and weekly limits (see the README).");
+    icon(p, pos2(r.min.x + 8.0, r.center().y), 4.6);
+    p.text(pos2(r.min.x + 19.0, r.center().y), Align2::LEFT_CENTER, name, FontId::proportional(11.5), theme.text);
+    if let Some(t) = updated {
+        p.text(pos2(r.max.x, r.center().y), Align2::RIGHT_CENTER, format!("updated {}", ago(now, t)), FontId::proportional(10.0), theme.muted.gamma_multiply(0.8));
     }
 }
 
@@ -988,27 +932,60 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
         ui.add_space(2.0);
     }
 
-    // ---- plan limits: one grid row per tool, or per Antigravity model group, with its 5-hour and
-    // weekly limit. Claude Code's come from its status line, Antigravity's from `agy -p /usage`.
-    // A limit whose reset time has passed reads 0% until the tool reports again (`Limit::at`).
+    // ---- plan limits: Claude Code's from its status line, Antigravity's from `agy -p /usage`.
+    // With both, each tool gets a heading row that says when its limits were read.
     let quota = s.agy_quota.as_deref().filter(|q| agy && !q.groups.is_empty());
     let claude_lim = s.limits.as_ref().filter(|l| l.five_hour.is_some() || l.seven_day.is_some());
+    let both = claude && quota.is_some();
     if claude || quota.is_some() {
-        limits_heading(ui, theme);
+        let updated = if both { None } else if claude { claude_lim.map(|l| l.updated) } else { quota.map(|q| q.updated) };
+        section(ui, theme, "PLAN LIMITS", |ui| {
+            if let Some(t) = updated {
+                ui.label(RichText::new(format!("updated {}", ago(s.now, t))).size(10.0).color(theme.muted.gamma_multiply(0.8)));
+            }
+        });
     }
     if claude {
+        if both {
+            limits_head(ui, theme, claude_icon, "Claude Code", claude_lim.map(|l| l.updated), s.now);
+        }
         match claude_lim {
             Some(l) => {
-                let line = LimitLine { icon: claude_icon, name: "Claude Code".into(), full: "Claude Code".into(), five_hour: l.five_hour, weekly: l.seven_day, updated: l.updated };
-                limit_line(ui, theme, &line, s.now);
+                // A window whose reset time has passed reads 0% until Claude Code reports again.
+                if let Some(w) = l.five_hour {
+                    limit_row(ui, theme, "5-hour", &w.at(s.now), s.now);
+                }
+                if let Some(w) = l.seven_day {
+                    ui.add_space(4.0);
+                    limit_row(ui, theme, "Weekly", &w.at(s.now), s.now);
+                }
             }
-            None => limit_missing(ui, theme, s.statusline_seen),
+            None => {
+                let msg = if s.statusline_seen {
+                    "Plan limits appear after Claude Code's next reply."
+                } else {
+                    "Set Claude Code's statusLine to `s-term statusline` to see your 5-hour and weekly limits (see README)."
+                };
+                ui.label(RichText::new(msg).size(11.0).color(theme.muted));
+            }
         }
     }
-    for g in quota.map(|q| q.groups.as_slice()).unwrap_or_default() {
-        let name = g.short_name().replace(" and ", " & ");
-        let line = LimitLine { icon: antigravity_icon, full: format!("Antigravity · {}", g.name.trim()), name, five_hour: g.five_hour, weekly: g.weekly, updated: quota.map_or(0, |q| q.updated) };
-        limit_line(ui, theme, &line, s.now);
+    if let Some(q) = quota {
+        if both {
+            ui.add_space(8.0);
+            limits_head(ui, theme, antigravity_icon, "Antigravity", Some(q.updated), s.now);
+        }
+        let mut first = true;
+        for g in &q.groups {
+            for (w, l) in [("5-hour", g.five_hour), ("Weekly", g.weekly)] {
+                let Some(l) = l else { continue };
+                if !first {
+                    ui.add_space(4.0);
+                }
+                first = false;
+                limit_row(ui, theme, &format!("{} · {w}", g.short_name()), &l.at(s.now), s.now);
+            }
+        }
     }
 
     // ---- usage: one total, one list of models across tools, one 24h chart
