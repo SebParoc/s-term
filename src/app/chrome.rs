@@ -325,10 +325,12 @@ impl STerm {
                     let lit = hover.max(on);
                     let clip = p.with_clip_rect(Rect::from_min_max(r.min, pos2(r.max.x - if lit > 0.05 { 28.0 } else { 10.0 }, r.max.y)));
                     let ink = lerp_color(lerp_color(theme.muted, theme.text, hover), theme.pick_ink, on);
-                    // Long titles (usually paths) lose their *start*, keeping the tail visible;
-                    // the full title is in the tooltip. Fixed close-button reserve so text doesn't jump on hover.
-                    let shown = elide_left(&p, &titles[i], &font, r.max.x - 28.0 - (r.min.x + 33.0));
-                    clip.text(pos2(r.min.x + 33.0, r.center().y), Align2::LEFT_CENTER, shown, font.clone(), ink);
+                    let text_x = r.min.x + 33.0;
+                    let title = titles[i].as_str();
+                    // Long paths lose their start and other titles their end; the full title is in the
+                    // tooltip. Fixed close-button reserve so text doesn't jump on hover.
+                    let shown = elide_title(&p, title, &font, r.max.x - 28.0 - text_x);
+                    clip.text(pos2(text_x, r.center().y), Align2::LEFT_CENTER, shown, font.clone(), ink);
                     if lit > 0.05 {
                         if xresp.hovered() {
                             p.rect_filled(xr, 10.0, if active { theme.pick_ink.gamma_multiply(0.12) } else { theme.header_focused });
@@ -599,27 +601,29 @@ impl STerm {
     }
 }
 
-/// Trim `text` from the left (prefixing "…") until it fits in `max_w` pixels.
-fn elide_left(p: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
+/// Fit a tab title in `max_w` pixels with a "…". A path (`~/…`, `/…`) loses its start, so the folder
+/// you're in stays visible; anything else (Claude Code, Codex and Antigravity title the tab with what
+/// the session is about) loses its end, since it reads from the start.
+fn elide_title(p: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
     let width = |t: &str| p.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
-    if width(text) <= max_w {
+    if text.is_empty() || width(text) <= max_w {
         return text.to_string();
     }
-    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
-    // Binary search for the smallest cut that fits.
-    let (mut lo, mut hi) = (1, starts.len());
+    let path = text.starts_with('~') || text.starts_with('/');
+    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).chain([text.len()]).collect();
+    let n = starts.len() - 1;
+    // The title with only `k` of its chars kept; binary search for the largest k that fits.
+    let cut = |k: usize| if path { format!("…{}", &text[starts[n - k]..]) } else { format!("{}…", text[..starts[k]].trim_end()) };
+    let (mut lo, mut hi) = (0, n - 1);
     while lo < hi {
-        let mid = (lo + hi) / 2;
-        if width(&format!("…{}", &text[starts[mid]..])) <= max_w {
-            hi = mid;
+        let mid = (lo + hi + 1) / 2;
+        if width(&cut(mid)) <= max_w {
+            lo = mid;
         } else {
-            lo = mid + 1;
+            hi = mid - 1;
         }
     }
-    match starts.get(lo) {
-        Some(&b) => format!("…{}", &text[b..]),
-        None => "…".to_string(),
-    }
+    cut(lo)
 }
 
 /// The pointer shape for resizing from an edge or corner.
