@@ -310,16 +310,19 @@ impl STerm {
 
     /// Starts another S-term process, opened in the focused pane's folder.
     fn new_window(&self) {
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => return eprintln!("s-term: new window: {e}"),
+        let exe = resolve_self_exe(std::env::current_exe().ok(), std::env::args_os().next());
+        let cwd = self.focused_cwd().filter(|d| d.is_dir());
+        let spawn = |path: &std::path::Path| {
+            let mut cmd = std::process::Command::new(path);
+            cmd.env_remove("S_TERM_SCREENSHOT").env_remove("S_TERM_DEMO");
+            if let Some(dir) = &cwd {
+                cmd.current_dir(dir);
+            }
+            cmd.spawn()
         };
-        let mut cmd = std::process::Command::new(exe);
-        cmd.env_remove("S_TERM_SCREENSHOT").env_remove("S_TERM_DEMO");
-        if let Some(cwd) = self.focused_cwd().filter(|d| d.is_dir()) {
-            cmd.current_dir(cwd);
-        }
-        match cmd.spawn() {
+        let proc_exe = std::path::Path::new("/proc/self/exe");
+        let res = spawn(&exe).or_else(|e| if exe == proc_exe { Err(e) } else { spawn(proc_exe) });
+        match res {
             // Reap it when it closes so it doesn't linger as a zombie.
             Ok(mut child) => drop(std::thread::spawn(move || child.wait())),
             Err(e) => eprintln!("s-term: new window: {e}"),
@@ -925,5 +928,62 @@ impl eframe::App for STerm {
         // popup's window (which shares this) is see-through around its glass. The backdrop paints
         // every pixel of the main window anyway.
         [0.0; 4]
+    }
+}
+
+/// Executable to run for a new window. Linux appends `" (deleted)"` to `/proc/self/exe` once
+/// the binary is rebuilt or updated on disk, so strip that suffix to launch the new build; fall
+/// back to an absolute `argv[0]`, and finally `/proc/self/exe` itself (which the kernel can still
+/// exec even after the file is unlinked).
+fn resolve_self_exe(cur: Option<PathBuf>, arg0: Option<std::ffi::OsString>) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(p) = cur {
+        if p.is_file() {
+            return p;
+        }
+        if let Some(stripped) = p.as_os_str().as_bytes().strip_suffix(b" (deleted)") {
+            let orig = PathBuf::from(std::ffi::OsStr::from_bytes(stripped));
+            if orig.is_file() {
+                return orig;
+            }
+        }
+    }
+    if let Some(a) = arg0.map(PathBuf::from).filter(|p| p.is_absolute() && p.is_file()) {
+        return a;
+    }
+    PathBuf::from("/proc/self/exe")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_self_exe;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    #[test]
+    fn resolve_exe_handles_rebuilt_binary() {
+        let dir = std::env::temp_dir().join(format!("s-term-exe-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("s-term");
+        let alt = dir.join("s-term-link");
+        std::fs::write(&bin, b"").unwrap();
+        std::fs::write(&alt, b"").unwrap();
+
+        // Normal: current_exe exists on disk.
+        assert_eq!(resolve_self_exe(Some(bin.clone()), None), bin);
+
+        // Rebuilt/updated in place: Linux appends " (deleted)" to /proc/self/exe.
+        let deleted = PathBuf::from(format!("{} (deleted)", bin.display()));
+        assert_eq!(resolve_self_exe(Some(deleted), None), bin);
+
+        // Removed at original path, but absolute argv[0] still points to an existing binary.
+        let gone = PathBuf::from(format!("{} (deleted)", dir.join("missing").display()));
+        assert_eq!(resolve_self_exe(Some(gone.clone()), Some(OsString::from(&alt))), alt);
+
+        // Relative argv[0] is ignored (new_window changes current_dir); falls back to /proc/self/exe.
+        assert_eq!(resolve_self_exe(Some(gone), Some(OsString::from("./s-term"))), PathBuf::from("/proc/self/exe"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
