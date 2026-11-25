@@ -290,6 +290,11 @@ fn local_offset(now: i64) -> i64 {
     }
 }
 
+/// Local hour of day (0-23) of a unix time.
+pub fn hour_of(ts: i64) -> i64 {
+    (ts + local_offset(ts)).rem_euclid(86400) / 3600
+}
+
 /// Local day number of a unix time.
 pub fn day_of(ts: i64) -> i64 {
     (ts + local_offset(ts)).div_euclid(86400)

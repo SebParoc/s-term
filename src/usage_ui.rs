@@ -862,7 +862,9 @@ fn hour_chart(ui: &mut egui::Ui, theme: &Theme, output: &[u64; 24], input: &[u64
     }
     if let Some(i) = hover {
         let hours_ago = 23 - i as i64;
-        let when = if hours_ago == 0 { "This hour".to_string() } else { format!("{hours_ago}h ago") };
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let h = crate::usage::hour_of(now - hours_ago * 3600);
+        let when = if hours_ago == 0 { format!("{h:02}:00 (this hour)") } else { format!("{h:02}:00") };
         // One widget spans all 24 bars, so anchor the tooltip to the hovered column, not the widget's left edge.
         let col = Rect::from_min_max(pos2(r.min.x + i as f32 * w, r.min.y), pos2(r.min.x + (i + 1) as f32 * w, r.max.y));
         egui::show_tooltip_for(ui.ctx(), ui.layer_id(), resp.id.with(i), &col, |ui| {
