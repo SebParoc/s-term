@@ -22,7 +22,7 @@ pub struct UsageUi {
     /// Heatmap filter: None = all models.
     heat_model: Option<String>,
     /// Screenshot mode's sample agents, shown instead of what the snapshot found.
-    pub demo: Option<HashMap<u64, PaneAgent>>,
+    pub demo: Option<HashMap<u32, PaneAgent>>,
 }
 
 impl Default for UsageUi {
@@ -31,13 +31,18 @@ impl Default for UsageUi {
     }
 }
 
-/// An AI CLI running in one of S-term's panes, as the UI sees it (refreshed every 500 ms). Its
-/// conversation is in `Snapshot::agents`, by pane.
+/// An AI CLI running in a pane of this S-term window or of another one, as the UI sees it
+/// (refreshed every 500 ms). Its conversation is in `Snapshot::agents`, by process group.
+#[derive(Clone, PartialEq, Debug)]
 pub struct AgentPane {
+    /// The other window's pid; None for this window.
+    pub window: Option<u32>,
     pub pane: u64,
     /// `claude`, `codex` or `agy`.
     pub tool: &'static str,
-    /// Its tab, from 0.
+    /// The process group it runs as.
+    pub pgid: u32,
+    /// Its tab in its window, from 0.
     pub tab: usize,
     /// The pane's title: the agents name it after what the conversation is about.
     pub title: String,
@@ -585,10 +590,10 @@ fn chevron(p: &Painter, c: Pos2, open: f32, color: Color32) {
     p.add(Shape::line(vec![at(-1.5, -3.5), at(2.0, 0.0), at(-1.5, 3.5)], Stroke::new(1.4_f32, color)));
 }
 
-/// A tool with agents in S-term's panes: its icon, its name and how many run, folding a row per
-/// agent. Returns the pane of the row clicked.
+/// A tool with agents in S-term's panes (of any window): its icon, its name and how many run,
+/// folding a row per agent. Returns the agent clicked.
 #[allow(clippy::too_many_arguments)]
-fn agent_group(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, agents: &[&AgentPane], data: &HashMap<u64, PaneAgent>, now: i64, focused: Option<u64>) -> Option<u64> {
+fn agent_group<'a>(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), name: &str, agents: &[&'a AgentPane], data: &HashMap<u32, PaneAgent>, now: i64, focused: Option<u64>) -> Option<&'a AgentPane> {
     let id = Id::new(("s-term-now", name));
     let mut fold = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true);
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), CLICK);
@@ -597,8 +602,8 @@ fn agent_group(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), 
     }
     let open = fold.openness(ui.ctx());
     let hover = ui.ctx().animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
-    // The snapshot's entry for a pane, unless another tool has started there since.
-    let entry = |a: &AgentPane| data.get(&a.pane).filter(|d| d.tool == a.tool);
+    // The snapshot's entry for an agent, unless another tool has taken its process group's place.
+    let entry = |a: &AgentPane| data.get(&a.pgid).filter(|d| d.tool == a.tool);
     let p = ui.painter();
     if hover > 0.0 {
         p.rect_filled(r, 8.0, theme.header.gamma_multiply(0.6 * hover));
@@ -616,8 +621,8 @@ fn agent_group(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), 
     let mut go = None;
     fold.show_body_unindented(ui, |ui| {
         for a in agents {
-            if agent_row(ui, theme, icon, a, entry(a), now, focused == Some(a.pane)).clicked() {
-                go = Some(a.pane);
+            if agent_row(ui, theme, icon, a, entry(a), now, a.window.is_none() && focused == Some(a.pane)).clicked() {
+                go = Some(*a);
             }
         }
     });
@@ -630,7 +635,7 @@ fn agent_group(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), 
 fn agent_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), a: &AgentPane, d: Option<&PaneAgent>, now: i64, focused: bool) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), CLICK);
     let live = d.and_then(|d| d.live.as_ref());
-    let hover = ui.ctx().animate_bool_with_time(Id::new(("s-term-now-agent", a.pane)), resp.hovered(), 0.1);
+    let hover = ui.ctx().animate_bool_with_time(Id::new(("s-term-now-agent", a.window, a.pane)), resp.hovered(), 0.1);
     let p = ui.painter();
     let bg = (if focused { 0.5_f32 } else { 0.0 }).max(0.7 * hover);
     if bg > 0.0 {
@@ -656,7 +661,11 @@ fn agent_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), a:
         working_dot(ui, p, pos2(r.max.x - 6.0, r.min.y + 13.0), theme);
     }
     let label = agent_label(a, d);
-    let place = if focused { "this pane".to_string() } else { format!("tab {}", a.tab + 1) };
+    let place = match a.window {
+        _ if focused => "this pane".to_string(),
+        Some(_) => format!("other window, tab {}", a.tab + 1),
+        None => format!("tab {}", a.tab + 1),
+    };
     let ctx_s = live.map(|l| match l.context_size {
         Some(sz) => format!("{} / {}", tokens(l.context_tokens), tokens(sz)),
         None => format!("{} tokens", tokens(l.context_tokens)),
@@ -672,7 +681,8 @@ fn agent_row(ui: &mut egui::Ui, theme: &Theme, icon: fn(&Painter, Pos2, f32), a:
 
     let mut tip = vec![label];
     let folder = d.and_then(|d| d.folder.as_deref()).map_or(String::new(), |f| format!("{f}  ·  "));
-    tip.push(format!("{folder}tab {}{}", a.tab + 1, if working { "  ·  working" } else { "" }));
+    let window = if a.window.is_some() { "another S-term window, " } else { "" };
+    tip.push(format!("{folder}{window}tab {}{}", a.tab + 1, if working { "  ·  working" } else { "" }));
     if let Some(l) = live {
         let used = ctx_s.unwrap_or_default();
         tip.push(match pct {
@@ -824,29 +834,41 @@ fn model_row(ui: &mut egui::Ui, theme: &Theme, l: &ModelLine, priced: bool) {
     });
 }
 
-fn sparkline(ui: &mut egui::Ui, theme: &Theme, hourly: &[u64; 24], color: Color32) {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+/// Tokens per hour for the last 24 hours (index 23 = this hour), mirrored around one baseline:
+/// output above it, input (cache included) right below it. Input is hundreds of times output, so
+/// each half has its own scale, and the caller labels each with its peak. Hover an hour for its
+/// numbers.
+fn hour_chart(ui: &mut egui::Ui, theme: &Theme, output: &[u64; 24], input: &[u64; 24]) {
+    let half = 22.0;
+    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 2.0 * half + 1.0), Sense::hover());
     let p = ui.painter();
-    let max = *hourly.iter().max().unwrap_or(&0);
+    let mid = r.min.y + half + 0.5;
     let w = r.width() / 24.0;
     let hover = resp.hover_pos().map(|pos| (((pos.x - r.min.x) / w) as usize).min(23));
-    p.line_segment([pos2(r.min.x, r.max.y + 0.5), pos2(r.max.x, r.max.y + 0.5)], Stroke::new(1.0_f32, theme.header));
-    for (i, &v) in hourly.iter().enumerate() {
-        if v == 0 || max == 0 {
-            continue;
+    p.line_segment([pos2(r.min.x, mid), pos2(r.max.x, mid)], Stroke::new(1.0_f32, theme.header));
+    for (vals, color, up) in [(output, theme.accent, true), (input, theme.accent2, false)] {
+        let max = *vals.iter().max().unwrap_or(&0);
+        for (i, &v) in vals.iter().enumerate() {
+            if v == 0 || max == 0 {
+                continue;
+            }
+            let f = v as f32 / max as f32;
+            let h = (f * (half - 1.5)).max(2.0);
+            let x = r.min.x + i as f32 * w;
+            let c = if hover == Some(i) { theme.text } else { color.gamma_multiply(0.35 + 0.65 * f) };
+            let (top, bottom) = if up { (mid - 1.5 - h, mid - 1.5) } else { (mid + 1.5, mid + 1.5 + h) };
+            p.rect_filled(Rect::from_min_max(pos2(x + 1.5, top), pos2(x + w - 1.5, bottom)), 1.5, c);
         }
-        let h = (v as f32 / max as f32 * r.height()).max(2.0);
-        let x = r.min.x + i as f32 * w;
-        let c = if hover == Some(i) { theme.text } else { color.gamma_multiply(0.35 + 0.65 * v as f32 / max as f32) };
-        p.rect_filled(Rect::from_min_max(pos2(x + 1.5, r.max.y - h), pos2(x + w - 1.5, r.max.y)), 1.5, c);
     }
     if let Some(i) = hover {
         let hours_ago = 23 - i as i64;
-        let when = if hours_ago == 0 { "this hour".to_string() } else { format!("{hours_ago}h ago") };
+        let when = if hours_ago == 0 { "This hour".to_string() } else { format!("{hours_ago}h ago") };
         // One widget spans all 24 bars, so anchor the tooltip to the hovered column, not the widget's left edge.
         let col = Rect::from_min_max(pos2(r.min.x + i as f32 * w, r.min.y), pos2(r.min.x + (i + 1) as f32 * w, r.max.y));
         egui::show_tooltip_for(ui.ctx(), ui.layer_id(), resp.id.with(i), &col, |ui| {
-            ui.label(format!("{when}: {} output tokens", tokens(hourly[i])));
+            ui.label(RichText::new(when).strong());
+            ui.label(format!("{} output tokens", tokens(output[i])));
+            ui.label(format!("{} input tokens", tokens(input[i])));
         });
     }
 }
@@ -886,9 +908,9 @@ pub fn card(ui: &mut egui::Ui, theme: &Theme, add: impl FnOnce(&mut egui::Ui)) {
 // ------------------------------------------------------------------------------------------- public
 
 /// The AI tab: one flat page in four sections (now, plan limits, usage, activity). No cards.
-/// `agents` are the AI CLIs in S-term's panes, in tab order; `focused` is the focused pane.
-/// Returns the pane to go to when one of the agents was clicked.
-pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mut UsageUi, cfg: &mut Config, agents: &[AgentPane], focused: Option<u64>) -> Option<u64> {
+/// `agents` are the AI CLIs in S-term's panes, this window's first, each window's in tab order;
+/// `focused` is this window's focused pane. Returns the agent clicked, to go to its pane.
+pub fn tab<'a>(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mut UsageUi, cfg: &mut Config, agents: &'a [AgentPane], focused: Option<u64>) -> Option<&'a AgentPane> {
     let Some(s) = snap else {
         ui.label(RichText::new("Reading usage…").color(theme.muted));
         return None;
@@ -1028,18 +1050,28 @@ pub fn tab(ui: &mut egui::Ui, theme: &Theme, snap: Option<&Snapshot>, state: &mu
     for m in &models {
         model_row(ui, theme, m, cost.is_some());
     }
-    let mut hourly = [0u64; 24];
+    let (mut hourly, mut hourly_in) = ([0u64; 24], [0u64; 24]);
     for (st, ..) in &tools {
-        for (h, v) in hourly.iter_mut().zip(st.hourly) {
-            *h += v;
+        for i in 0..24 {
+            hourly[i] += st.hourly[i];
+            hourly_in[i] += st.hourly_in[i];
         }
     }
     let sessions: usize = tools.iter().map(|(st, ..)| st.sessions_today).sum();
     ui.add_space(16.0);
-    sparkline(ui, theme, &hourly, theme.accent);
-    ui.add_space(3.0);
+    // Output above the line, input below it, each half to its own scale, so each says its peak.
+    let peak = |v: &[u64; 24]| tokens(v.iter().copied().max().unwrap_or(0));
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Output, last 24 hours").size(10.5).color(theme.muted));
+        ui.label(RichText::new(format!("Output · peak {}", peak(&hourly))).size(10.5).color(theme.muted));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(RichText::new("last 24 hours").size(10.5).color(theme.muted));
+        });
+    });
+    ui.add_space(2.0);
+    hour_chart(ui, theme, &hourly, &hourly_in);
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(format!("Input · peak {}", peak(&hourly_in))).size(10.5).color(theme.muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(RichText::new(format!("{sessions} session{} today", if sessions == 1 { "" } else { "s" })).size(10.5).color(theme.muted));
         });

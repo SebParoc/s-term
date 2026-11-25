@@ -234,13 +234,16 @@ command lines. Turn it off in Settings → Terminal → *Remember closed tabs*.
 Usage tracking is optional. During setup, S-term asks which AI coding tools you use (Claude Code, Codex, Antigravity)
 and turns on the ones it finds. You can change them in Settings → AI tools. The AI view has four sections:
 
-- **Now:** each tool folds open to list its agents running in S-term, in any tab or pane: what the pane is about,
-  a context ring with the percentage used (yellow at 50%, red at 75%), the tokens against the window, the model and
-  the tab. A green dot pulses while one works. Click an agent to go to its pane, or a tool to fold its list.
+- **Now:** each tool folds open to list its agents running in S-term, in any tab or pane of any S-term window: what
+  the pane is about, a context ring with the percentage used (yellow at 50%, red at 75%), the tokens against the
+  window, the model and the tab. A green dot pulses while one works. Click an agent to go to its pane, or a tool to
+  fold its list. An agent in another window switches that window to its pane and asks the desktop to bring the window
+  forward; GNOME on Wayland may only show an "S-term is ready" notice instead.
 - **Plan limits:** Claude Code's 5-hour and weekly limits, and Antigravity's for each of its model groups, with reset
   countdowns
 - **Usage:** tokens per model across the tools you turned on, for the last 5 hours, today or the last 7 days, plus a
-  24-hour output chart. Next to the tokens is what they would cost on the providers' pay-as-you-go APIs, in USD, at
+  chart of the last 24 hours with output tokens per hour above the line and input tokens (cache included) mirrored
+  below it. Each half has its own scale and shows its peak. Next to the tokens is what they would cost on the providers' pay-as-you-go APIs, in USD, at
   Anthropic's, OpenAI's and Google's list prices (Claude Code's 1-hour cache writes and fast mode included). It's an
   equivalent: your plan bills differently. Hover a model for its breakdown by kind of token.
 - **Activity:** a calendar heatmap of daily tokens (output tokens or all tokens, see Settings → AI tools). Pick a
@@ -429,6 +432,7 @@ glibc as new as yours.
 | `src/app/devshot.rs` | Screenshot mode |
 | `src/assistant/` | Ask S-term: the tool-calling loop, Anthropic / OpenAI / Gemini requests, API keys |
 | `src/pane.rs` | One shell session (PTY and emulator state), and reading its folder and program from `/proc` |
+| `src/peers.rs` | The other S-term windows: shares each window's agent panes and passes "go to this pane" between windows |
 | `src/layout.rs` | The split tree |
 | `src/render.rs` | Grid painting |
 | `src/input.rs` | Keybindings, and keys to escape sequences |
@@ -440,7 +444,7 @@ glibc as new as yours.
 | `src/usage_ui.rs` | AI view, its icons and the status-bar meter |
 | `src/config.rs` | Settings file |
 | `src/theme.rs` | Color themes |
-| `src/fonts.rs` | Bundled fonts and the installed-font picker |
+| `src/fonts.rs` | Bundled fonts, the installed-font picker, and system fonts loaded on demand for missing characters |
 | `src/glass.rs` | Glass surfaces, the backdrop, the selection pill and the search orb |
 | `src/icons.rs` | Vector line icons |
 | `scripts/install.sh` | Installs from a clone (builds it) or from a release tarball, and `--uninstall` |
@@ -458,7 +462,9 @@ glibc as new as yours.
 ## Credits
 
 S-term ships **JetBrains Mono** for the terminal and **Inter** for the interface, both under the SIL Open Font
-License. Their licenses are in `assets/fonts/`. You can pick any installed monospace font in Settings. The scorpion
+License. Their licenses are in `assets/fonts/`. You can pick any installed monospace font in Settings. A character
+that none of these has (symbols, CJK, Nerd Font icons) is drawn with an installed font that does, found through
+fontconfig. The scorpion
 "S" app icon is in `assets/icon/`.
 
 ## License

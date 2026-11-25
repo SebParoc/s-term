@@ -7,7 +7,7 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::CursorShape;
 use egui::{pos2, vec2, Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Stroke, Vec2};
 
-use crate::fonts::MONO_BOLD;
+use crate::fonts::{MONO_BOLD, TOFU};
 use crate::pane::Listener;
 use crate::theme::{c32, lerp_rect, Theme};
 
@@ -15,11 +15,13 @@ use crate::theme::{c32, lerp_rect, Theme};
 pub struct GlyphCache {
     map: HashMap<(char, bool), Arc<Galley>>,
     size: f32,
+    /// Characters no installed font has, for the app to find a system font for (`fonts::Fallbacks`).
+    pub missing: Vec<char>,
 }
 
 impl GlyphCache {
     pub fn new(size: f32) -> Self {
-        Self { map: HashMap::new(), size }
+        Self { map: HashMap::new(), size, missing: Vec::new() }
     }
 
     pub fn reset(&mut self, size: f32) {
@@ -287,13 +289,25 @@ pub fn paint_terminal(
     let galleys: Vec<Arc<Galley>> = p.ctx().fonts(|fonts| {
         reqs.iter()
             .map(|r| match &r.combining {
-                Some(s) => fonts.layout_no_wrap(s.clone(), glyphs.font(r.bold), Color32::WHITE),
+                Some(s) => {
+                    let font = glyphs.font(r.bold);
+                    if r.c != TOFU && !fonts.has_glyph(&font, r.c) {
+                        glyphs.missing.push(r.c);
+                    }
+                    fonts.layout_no_wrap(s.clone(), font, Color32::WHITE)
+                }
                 None => {
                     let font = glyphs.font(r.bold);
+                    let missing = &mut glyphs.missing;
                     glyphs
                         .map
                         .entry((r.c, r.bold))
-                        .or_insert_with(|| fonts.layout_no_wrap(r.c.to_string(), font, Color32::WHITE))
+                        .or_insert_with(|| {
+                            if r.c != TOFU && !fonts.has_glyph(&font, r.c) {
+                                missing.push(r.c);
+                            }
+                            fonts.layout_no_wrap(r.c.to_string(), font, Color32::WHITE)
+                        })
                         .clone()
                 }
             })

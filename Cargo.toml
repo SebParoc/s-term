@@ -15,6 +15,8 @@ alacritty_terminal = "0.24"
 # Window + GPU rendering + input
 eframe = "0.29"
 egui = "0.29"
+# Already in the tree through egui: checks that a system font parses and has a glyph before egui gets it
+ab_glyph = "0.2"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

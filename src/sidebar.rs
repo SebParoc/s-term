@@ -615,8 +615,8 @@ pub enum UiAction {
     Launcher(u64, crate::launchpad::Op),
     /// Reopen, delete… a History entry (by id).
     History(u64, crate::history::Op),
-    /// Go to a pane (and its tab).
-    FocusPane(crate::pane::PaneId),
+    /// Go to a pane (and its tab): in this window (None) or in another S-term window (its pid).
+    FocusPane(Option<u32>, crate::pane::PaneId),
 }
 
 pub struct Sidebar {
@@ -661,7 +661,7 @@ pub struct Sidebar {
     dragging: Option<PathBuf>,
     pub usage: crate::usage::Usage,
     usage_ui: crate::usage_ui::UsageUi,
-    /// The AI CLIs in S-term's panes, in tab order, for the AI view (kept up to date by the app).
+    /// The AI CLIs in S-term's panes, this window's first, for the AI view (kept up to date by the app).
     pub agents: Vec<crate::usage_ui::AgentPane>,
     /// The focused pane, for the AI view's agent list.
     pub focused_pane: Option<crate::pane::PaneId>,
@@ -869,7 +869,7 @@ impl Sidebar {
     }
 
     /// Screenshot mode: sample agents in the AI view, in place of the real ones.
-    pub fn agents_demo(&mut self, agents: Vec<crate::usage_ui::AgentPane>, data: HashMap<u64, crate::usage::PaneAgent>) {
+    pub fn agents_demo(&mut self, agents: Vec<crate::usage_ui::AgentPane>, data: HashMap<u32, crate::usage::PaneAgent>) {
         self.agents = agents;
         self.usage_ui.demo = Some(data);
     }
@@ -1139,8 +1139,8 @@ impl Sidebar {
                 if self.tab == Tab::Ai {
                     let usage = self.usage.snapshot();
                     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
-                        if let Some(pane) = crate::usage_ui::tab(ui, theme, usage.as_deref(), &mut self.usage_ui, cfg, &self.agents, self.focused_pane) {
-                            actions.push(UiAction::FocusPane(pane));
+                        if let Some(a) = crate::usage_ui::tab(ui, theme, usage.as_deref(), &mut self.usage_ui, cfg, &self.agents, self.focused_pane) {
+                            actions.push(UiAction::FocusPane(a.window, a.pane));
                         }
                     });
                     return;

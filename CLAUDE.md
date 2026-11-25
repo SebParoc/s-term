@@ -110,6 +110,14 @@ or sends on a channel, then calls `ctx.request_repaint()`:
   child (every minute while `agy` runs, every 10 minutes otherwise, only while Antigravity is on in Settings). Don't
   read its login from the keyring instead.
   `usage_ui.rs` draws the AI view and the status-bar meter.
+- **Peers** (`peers.rs`, thread `s-term-peers`): each window is its own process. It writes its agent panes (from
+  `track_agents`, every 500 ms) to `$XDG_RUNTIME_DIR/s-term/windows/<pid>.json`, reads the other windows' files every
+  400 ms, and deletes those of windows that are gone. Each window listens on `<pid>.sock` for `focus <pane>` (nothing
+  else is accepted). Screenshot mode stays out of it.
+- **Font fallbacks** (`fonts::Fallbacks`, thread `s-term-fonts`): `render.rs` reports each character no installed
+  font has (`GlyphCache::missing`); the thread finds a system font for it with `fc-match` and `STerm::font_fallbacks`
+  installs it. egui panics on a font file it can't parse, so every system font is checked with `ab_glyph` first.
+  `set_fonts` takes effect a frame later: set `fonts_changed` rather than resetting the glyph cache at once.
 - **Assistant**: see below.
 
 ### Launchpad (`src/launchpad.rs` + `src/app/launch.rs`)

@@ -91,11 +91,10 @@ pub struct Live {
     pub here: bool,
 }
 
-/// An AI CLI in one of S-term's panes, as the UI reports it: the pane, the tool (`claude`, `codex`
-/// or `agy`) and the process group it runs as.
+/// An AI CLI in a pane of any S-term window, as the UI reports it: the tool (`claude`, `codex` or
+/// `agy`) and the process group it runs as.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AgentProc {
-    pub pane: u64,
     pub tool: &'static str,
     pub pgid: u32,
 }
@@ -117,6 +116,8 @@ pub struct ToolStats {
     pub windows: HashMap<Window, Vec<ModelTotal>>,
     /// Output tokens per hour for the last 24 hours (index 23 = current hour).
     pub hourly: [u64; 24],
+    /// Input tokens per hour, cache reads and writes included, like `hourly`.
+    pub hourly_in: [u64; 24],
     pub sessions_today: usize,
     pub live: Option<Live>,
     pub last_active: Option<i64>,
@@ -219,8 +220,8 @@ pub struct Snapshot {
     pub statusline_seen: bool,
     /// Antigravity's plan quota, once `agy -p /usage` has answered.
     pub agy_quota: Option<Arc<AgyQuota>>,
-    /// The agents running in S-term's panes (see `Usage::set_agents`), by pane.
-    pub agents: HashMap<u64, PaneAgent>,
+    /// The agents running in S-term's panes (see `Usage::set_agents`), by process group.
+    pub agents: HashMap<u32, PaneAgent>,
 }
 
 // ------------------------------------------------------------------------------------------ helpers
@@ -403,6 +404,7 @@ fn tool_stats<'a>(sessions: impl Iterator<Item = &'a [Rec]> + Clone, now: i64) -
         if r.ts >= hour0 {
             let i = ((r.ts - hour0) / 3600).clamp(0, 23) as usize;
             st.hourly[i] += r.output;
+            st.hourly_in[i] += r.context();
         }
         st.last_active = st.last_active.max(Some(r.ts));
     }
@@ -1126,7 +1128,7 @@ impl CodexScanner {
 
 /// The conversation of each agent in S-term's panes: Claude Code's from `sessions/<pid>.json`,
 /// Codex's from the rollout file it has open, Antigravity's from the presence lock it holds.
-fn pane_agents(procs: &[AgentProc], claude: &ClaudeScanner, codex: &CodexScanner, agy: &AgyScanner, status: &HashMap<String, (i64, Value)>) -> HashMap<u64, PaneAgent> {
+fn pane_agents(procs: &[AgentProc], claude: &ClaudeScanner, codex: &CodexScanner, agy: &AgyScanner, status: &HashMap<String, (i64, Value)>) -> HashMap<u32, PaneAgent> {
     let home = home();
     procs
         .iter()
@@ -1138,7 +1140,7 @@ fn pane_agents(procs: &[AgentProc], claude: &ClaudeScanner, codex: &CodexScanner
                 _ => None,
             });
             let folder = std::fs::read_link(format!("/proc/{}/cwd", a.pgid)).ok().and_then(|d| if d == home { Some("~".into()) } else { d.file_name().map(|n| n.to_string_lossy().into_owned()) });
-            (a.pane, PaneAgent { tool: a.tool, folder, live })
+            (a.pgid, PaneAgent { tool: a.tool, folder, live })
         })
         .collect()
 }
@@ -1222,7 +1224,8 @@ impl Usage {
         Self { shared, focus, agy_quota, agents }
     }
 
-    /// The AI CLIs running in S-term's panes, so the snapshot has each one's conversation.
+    /// The AI CLIs running in S-term's panes (of every window), so the snapshot has each one's
+    /// conversation.
     pub fn set_agents(&self, agents: Vec<AgentProc>) {
         *lock(&self.agents) = agents;
     }

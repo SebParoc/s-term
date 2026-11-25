@@ -68,6 +68,10 @@ pub struct STerm {
     cell: Vec2,
     glyphs: GlyphCache,
     faux_bold: bool,
+    /// System fonts found for characters the installed ones lack.
+    fallbacks: fonts::Fallbacks,
+    /// `set_fonts` was called last frame, so the new fonts are live from this one.
+    fonts_changed: bool,
     /// On-screen (animated) pane rects, gliding toward their layout targets.
     anim_rects: HashMap<PaneId, Rect>,
     /// Freshly split panes and the direction they grow in from.
@@ -107,6 +111,8 @@ pub struct STerm {
     launch_checked: Option<Instant>,
     /// Closed tabs and the last session (the History view).
     hist: history::HistState,
+    /// The other S-term windows: their agents, and requests to show one of this window's panes.
+    peers: crate::peers::Peers,
     /// A V press or a Paste event arrived since the last V release (see `handle_keyboard`).
     v_seen: bool,
 }
@@ -121,7 +127,8 @@ impl STerm {
             s.animation_time = if config.animations { 1.0 / 10.0 } else { 0.0 };
             s.spacing.button_padding = vec2(10.0, 5.0);
         });
-        let font = fonts::install(&ctx, &config.font_family);
+        let fallbacks = fonts::Fallbacks::new(&ctx);
+        let font = fonts::install(&ctx, &config.font_family, &fallbacks);
 
         let (tx, rx) = channel();
         let mut app = Self {
@@ -139,6 +146,8 @@ impl STerm {
             metrics_for: (0.0, 0.0, 0.0),
             cell: vec2(8.0, 17.0),
             faux_bold: font.faux_bold,
+            fallbacks,
+            fonts_changed: false,
             anim_rects: HashMap::new(),
             spawn_from: HashMap::new(),
             last_area: Rect::NOTHING,
@@ -157,6 +166,8 @@ impl STerm {
             settings: Default::default(),
             last_follow: Instant::now() - Duration::from_secs(10),
             frame_resizing: false,
+            // Screenshots stay out of the other windows' lists.
+            peers: crate::peers::Peers::new(ctx.clone(), std::env::var_os("S_TERM_SCREENSHOT").is_none()),
             devshot: devshot::DevShot::from_env(),
             logo: ctx.load_texture(
                 "s-term-logo",
@@ -199,8 +210,8 @@ impl STerm {
             self.theme.apply_visuals(ctx);
         }
         if new.font_family != old.font_family {
-            self.faux_bold = fonts::install(ctx, &new.font_family).faux_bold;
-            self.metrics_for = (0.0, 0.0, 0.0);
+            self.faux_bold = fonts::install(ctx, &new.font_family, &self.fallbacks).faux_bold;
+            self.fonts_changed = true;
         }
         if new.animations != old.animations {
             let on = new.animations;
@@ -253,22 +264,35 @@ impl STerm {
         self.focused().and_then(|p| p.cwd())
     }
 
-    /// Finds the AI CLIs running in panes, in tab order: the AI view lists them, and the usage
-    /// worker looks up each one's conversation from its process group.
+    /// Finds the AI CLIs running in this window's panes, in tab order, and shares them with the
+    /// other S-term windows. The AI view lists them followed by the other windows' ones, and the
+    /// usage worker looks up each one's conversation from its process group.
     fn track_agents(&mut self) {
-        let (mut list, mut procs) = (Vec::new(), Vec::new());
+        let mut list = Vec::new();
         for (ti, tab) in self.tabs.iter().enumerate() {
             let mut leaves = Vec::new();
             tab.root.leaves(&mut leaves);
             for id in leaves {
                 let Some(p) = self.panes.get(&id) else { continue };
                 let (Some(tool), Some(pgid)) = (p.ai_tool(), p.foreground_pgid()) else { continue };
-                list.push(crate::usage_ui::AgentPane { pane: id, tool, tab: ti, title: p.title.clone() });
-                procs.push(crate::usage::AgentProc { pane: id, tool, pgid });
+                list.push(crate::usage_ui::AgentPane { window: None, pane: id, tool, pgid, tab: ti, title: p.title.clone() });
             }
         }
-        self.sidebar.usage.set_agents(procs);
+        self.peers.set_mine(&list);
+        list.extend(self.peers.others().iter().cloned());
+        self.sidebar.usage.set_agents(list.iter().map(|a| crate::usage::AgentProc { tool: a.tool, pgid: a.pgid }).collect());
         self.sidebar.agents = list;
+    }
+
+    /// Another window's AI view asked to see one of this window's panes: show it and raise the
+    /// window (the compositor may only flag it as wanting attention instead).
+    fn peer_requests(&mut self, ctx: &egui::Context) {
+        while let Some(pane) = self.peers.focus_request() {
+            if self.focus_pane(pane) {
+                ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(ViewportCommand::Focus);
+            }
+        }
     }
 
     fn new_tab(&mut self) {
@@ -679,7 +703,10 @@ impl STerm {
         while let Ok((id, ev)) = self.rx.try_recv() {
             let Some(pane) = self.panes.get_mut(&id) else { continue };
             match ev {
-                TermEvent::Title(t) => pane.title = t,
+                TermEvent::Title(t) => {
+                    self.fallbacks.want_text(ctx, &t);
+                    pane.title = t;
+                }
                 TermEvent::ResetTitle => pane.title = "shell".into(),
                 TermEvent::PtyWrite(s) => pane.write(s.into_bytes()),
                 TermEvent::ClipboardStore(_, s) => ctx.output_mut(|o| o.copied_text = s),
@@ -713,9 +740,10 @@ impl STerm {
                 UiAction::Drop(path, pos) => self.drop_paths(&[path], pos),
                 UiAction::Launcher(id, op) => self.launch_op(id, op),
                 UiAction::History(id, op) => self.history_op(id, op),
-                UiAction::FocusPane(id) => {
+                UiAction::FocusPane(None, id) => {
                     self.focus_pane(id);
                 }
+                UiAction::FocusPane(Some(window), id) => self.peers.focus(window, id),
             }
         }
     }
@@ -772,6 +800,23 @@ impl STerm {
 
     // ---------------------------------------------------------------- metrics & title
 
+    /// Adds system fonts for the characters the terminal met that no installed font has.
+    fn font_fallbacks(&mut self, ctx: &egui::Context) {
+        // egui switches fonts at the start of the frame after `set_fonts`. Only then are the cell
+        // size and the cached glyphs out of date.
+        if std::mem::take(&mut self.fonts_changed) {
+            self.metrics_for = (0.0, 0.0, 0.0);
+        }
+        for c in self.glyphs.missing.drain(..) {
+            self.fallbacks.want(c);
+        }
+        if self.fallbacks.poll() {
+            self.faux_bold = fonts::install(ctx, &self.config.font_family, &self.fallbacks).faux_bold;
+            self.fonts_changed = true;
+            ctx.request_repaint();
+        }
+    }
+
     fn ensure_metrics(&mut self, ctx: &egui::Context) {
         let ppp = ctx.pixels_per_point();
         let key = (self.config.font_size, ppp, self.config.line_height);
@@ -803,9 +848,11 @@ impl STerm {
 
 impl eframe::App for STerm {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.font_fallbacks(ctx);
         self.apply_config(ctx);
         self.ensure_metrics(ctx);
         self.process_term_events(ctx);
+        self.peer_requests(ctx);
         self.handle_keyboard(ctx);
         self.wheel_zoom(ctx);
         if self.tabs.is_empty() {

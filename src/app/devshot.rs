@@ -99,7 +99,8 @@ fn demo_launchers() -> Vec<crate::config::Launcher> {
 
 impl STerm {
     /// Sample agents in the AI view, one per pane in tab order: two Claude Code sessions (one
-    /// working), a Codex one nearly out of context, and an Antigravity one.
+    /// working), a Codex one nearly out of context, and an Antigravity one; plus a Claude Code
+    /// session in another window.
     fn agents_demo(&mut self) {
         use crate::usage::{Live, PaneAgent};
         use crate::usage_ui::AgentPane;
@@ -117,11 +118,15 @@ impl STerm {
             tab.root.leaves(&mut leaves);
             panes.extend(leaves.into_iter().map(|id| (ti, id)));
         }
-        for ((ti, id), (tool, title, model, used, size, ago)) in panes.into_iter().zip(samples) {
-            list.push(AgentPane { pane: id, tool, tab: ti, title: title.into() });
+        // Made-up process groups and another window's pid.
+        let other = (Some(4242), 1, 0, ("claude", "✳ Write the release notes", "claude-opus-5-5", 410_000, 1_000_000, 1200));
+        let here = panes.into_iter().zip(samples).map(|((ti, id), s)| (None, id, ti, s));
+        for (i, (window, id, ti, (tool, title, model, used, size, ago))) in here.chain([other]).enumerate() {
+            let pgid = 990_000 + i as u32;
+            list.push(AgentPane { window, pane: id, tool, pgid, tab: ti, title: title.into() });
             let label = if tool == "agy" { "Port the renderer to wgpu".into() } else { String::new() };
             let live = Live { label, model: model.into(), context_tokens: used, context_size: Some(size), context_pct: None, last_ts: now - ago, requests: 12, totals: Vec::new(), here: false };
-            data.insert(id, PaneAgent { tool, folder: Some("s-term".into()), live: Some(live) });
+            data.insert(pgid, PaneAgent { tool, folder: Some("s-term".into()), live: Some(live) });
         }
         self.sidebar.agents_demo(list, data);
     }
