@@ -46,6 +46,16 @@ impl Dimensions for GridSize {
     }
 }
 
+/// A mouse button held down on a pane, and who it belongs to (decided when it goes down; see `app/panes.rs`).
+#[derive(Clone, Copy, Debug)]
+pub enum Press {
+    /// Reported to the program, which asked for mouse events: 0, 1 or 2 for the left, middle or right button.
+    App { button: u8 },
+    /// S-term's own selection, anchored in grid lines where the button went down so scrolling can't move it.
+    /// `started` once a drag or the wheel has made the selection.
+    Select { anchor: alacritty_terminal::index::Point, side: alacritty_terminal::index::Side, started: bool },
+}
+
 fn window_size(size: GridSize, cell: egui::Vec2) -> WindowSize {
     WindowSize {
         num_lines: size.rows as u16,
@@ -65,6 +75,11 @@ pub struct Pane {
     child_pid: u32,
     /// Fractional wheel scroll not yet applied, in lines.
     pub scroll_accum: f32,
+    /// Fractional lines not yet scrolled while a selection is dragged past the top or bottom.
+    pub edge_scroll: f32,
+    pub press: Option<Press>,
+    /// The cell the last mouse report to the program was for, so moving within one cell sends nothing.
+    pub mouse_cell: Option<(usize, usize)>,
     pub cursor_anim: crate::render::CursorAnim,
     /// `ai_tool`'s last answer and when it was read.
     ai: Cell<(Option<std::time::Instant>, Option<&'static str>)>,
@@ -114,6 +129,9 @@ impl Pane {
             cell,
             child_pid,
             scroll_accum: 0.0,
+            edge_scroll: 0.0,
+            press: None,
+            mouse_cell: None,
             cursor_anim: Default::default(),
             ai: Cell::new((None, None)),
         })

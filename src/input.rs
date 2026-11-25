@@ -198,15 +198,22 @@ pub fn key_to_bytes(key: Key, m: Modifiers, app_cursor: bool) -> Option<(Vec<u8>
     Some((s.into_bytes(), false))
 }
 
-/// Encode a mouse button event at a 0-based cell (xterm protocol). Wheel up = 64, down = 65.
-pub fn mouse_report(button: u8, col: usize, row: usize, sgr: bool) -> Vec<u8> {
+/// Encode a mouse event at a 0-based cell (xterm protocol): buttons 0-2 are left, middle and right, 64/65 the
+/// wheel up and down; add 32 for a move with the button held (35 for a move with none) and `mouse_mods`.
+pub fn mouse_report(button: u8, col: usize, row: usize, sgr: bool, pressed: bool) -> Vec<u8> {
     if sgr {
-        format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+        format!("\x1b[<{button};{};{}{}", col + 1, row + 1, if pressed { 'M' } else { 'm' }).into_bytes()
     } else {
-        // Legacy X10 encoding: each value offset by 32, limited to 223.
+        // Legacy X10 encoding: each value offset by 32, limited to 223. A release doesn't say which button (3).
         let enc = |v: usize| (32 + v + 1).min(255) as u8;
+        let button = if pressed { button } else { (button & !3) | 3 };
         vec![0x1b, b'[', b'M', 32 + button, enc(col), enc(row)]
     }
+}
+
+/// The Alt and Ctrl bits of a mouse report. Shift isn't sent: with Shift held the mouse stays with S-term.
+pub fn mouse_mods(m: Modifiers) -> u8 {
+    8 * m.alt as u8 + 16 * m.ctrl as u8
 }
 
 #[cfg(test)]
@@ -215,8 +222,17 @@ mod tests {
 
     #[test]
     fn wheel_reports() {
-        assert_eq!(mouse_report(64, 0, 0, true), b"\x1b[<64;1;1M");
-        assert_eq!(mouse_report(65, 9, 4, false), vec![0x1b, b'[', b'M', 97, 42, 37]);
+        assert_eq!(mouse_report(64, 0, 0, true, true), b"\x1b[<64;1;1M");
+        assert_eq!(mouse_report(65, 9, 4, false, true), vec![0x1b, b'[', b'M', 97, 42, 37]);
+    }
+
+    #[test]
+    fn button_reports() {
+        assert_eq!(mouse_report(0, 4, 2, true, true), b"\x1b[<0;5;3M");
+        assert_eq!(mouse_report(32, 5, 2, true, true), b"\x1b[<32;6;3M");
+        assert_eq!(mouse_report(0, 5, 2, true, false), b"\x1b[<0;6;3m");
+        // X10 has no button in a release, but keeps the modifiers.
+        assert_eq!(mouse_report(16 + 2, 0, 0, false, false), vec![0x1b, b'[', b'M', 32 + 16 + 3, 33, 33]);
     }
 
     #[test]

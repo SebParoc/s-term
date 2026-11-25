@@ -12,7 +12,7 @@ use crate::config::{CursorStyle, PaneHeaders};
 use crate::icons::{self, Icon};
 use crate::input;
 use crate::layout::{Divider, Orientation};
-use crate::pane::GridSize;
+use crate::pane::{GridSize, Press};
 use crate::render;
 use crate::theme::{c32, lerp_color, lerp_rect};
 
@@ -28,6 +28,11 @@ const CURSOR_SPEED: f32 = 38.0;
 /// The cursor's trailing edge, slower than the head so moves leave a short smear.
 const CURSOR_TAIL_SPEED: f32 = 18.0;
 const TAB_FADE_SECS: f32 = 0.15;
+/// Lines per second a selection dragged past the top or bottom of the text scrolls: the minimum, how much more for
+/// each line's height further out, and the cap.
+const EDGE_SCROLL_MIN: f32 = 10.0;
+const EDGE_SCROLL_PER_CELL: f32 = 6.0;
+const EDGE_SCROLL_MAX: f32 = 200.0;
 
 fn grid_point(pos: Pos2, origin: Pos2, cell: Vec2, size: GridSize, offset: usize) -> (Point, Side) {
     let x = ((pos.x - origin.x) / cell.x).max(0.0);
@@ -36,6 +41,13 @@ fn grid_point(pos: Pos2, origin: Pos2, cell: Vec2, size: GridSize, offset: usize
     let row = (y as usize).min(size.rows.saturating_sub(1));
     let side = if x.fract() > 0.5 { Side::Right } else { Side::Left };
     (Point::new(Line(row as i32 - offset as i32), Column(col)), side)
+}
+
+/// The (column, row) on screen under `pos`, clamped to the grid so a drag past the pane's edge stays on it.
+fn cell_at(pos: Pos2, origin: Pos2, cell: Vec2, size: GridSize) -> (usize, usize) {
+    let col = (((pos.x - origin.x) / cell.x).max(0.0) as usize).min(size.cols.saturating_sub(1));
+    let row = (((pos.y - origin.y) / cell.y).max(0.0) as usize).min(size.rows.saturating_sub(1));
+    (col, row)
 }
 
 /// Splits a pane rect into (header, body, terminal text area).
@@ -122,7 +134,8 @@ impl STerm {
         let painter = ui.painter().clone();
 
         let mut new_focus = None;
-        let scroll_y = ui.input(|i| i.smooth_scroll_delta.y) * self.config.scroll_speed;
+        // egui turns Shift+wheel into horizontal scrolling; here it's still vertical (it bypasses mouse reporting).
+        let scroll_y = ui.input(|i| if i.modifiers.shift { i.smooth_scroll_delta.x } else { i.smooth_scroll_delta.y }) * self.config.scroll_speed;
         let cursor_shape = match self.config.cursor_style {
             CursorStyle::App => None,
             CursorStyle::Block => Some(CursorShape::Block),
@@ -158,64 +171,125 @@ impl STerm {
             }
             {
                 let mut term = pane.term.lock();
+                let mode = *term.mode();
+                let mods = ui.input(|i| i.modifiers);
+                let sgr = mode.contains(TermMode::SGR_MOUSE);
+                let app_mouse = mode.intersects(TermMode::MOUSE_MODE);
                 let offset = term.grid().display_offset();
                 let at = |pos| grid_point(pos, origin, cell, size, offset);
-                if let Some(pos) = resp.interact_pointer_pos() {
-                    let (pt, side) = at(pos);
-                    if resp.triple_clicked() {
-                        term.selection = Some(Selection::new(SelectionType::Lines, pt, side));
-                    } else if resp.double_clicked() {
-                        term.selection = Some(Selection::new(SelectionType::Semantic, pt, side));
-                    } else if resp.clicked() {
+                // Bytes for the program, written once the terminal is unlocked.
+                let mut out = Vec::new();
+                let down = resp.is_pointer_button_down_on();
+
+                // Who gets a press is decided when the button goes down. A program that asked for mouse events
+                // (Claude Code's fullscreen view, vim, htop...) gets it and does its own selection; Shift keeps it
+                // for S-term's selection, which is anchored now so scrolling before the drag can't move it.
+                if down && pane.press.is_none() {
+                    let pos = press_origin.or(resp.interact_pointer_pos()).unwrap_or(origin);
+                    // Presses on the header only focus the pane.
+                    pane.press = Some(if app_mouse && !mods.shift && body.contains(pos) {
+                        let button = ui.input(|i| if i.pointer.primary_down() { 0 } else if i.pointer.middle_down() { 1 } else { 2 });
+                        let (col, row) = cell_at(pos, origin, cell, size);
+                        out.extend(input::mouse_report(button | input::mouse_mods(mods), col, row, sgr, true));
+                        pane.mouse_cell = Some((col, row));
                         term.selection = None;
+                        Press::App { button }
+                    } else {
+                        let (anchor, side) = at(pos);
+                        Press::Select { anchor, side, started: false }
+                    });
+                }
+                let press = pane.press;
+                match press {
+                    Some(Press::App { button }) => {
+                        // Moves and the release are reported at the nearest cell, even off the pane's edge.
+                        let pos = resp.interact_pointer_pos().or(ctx.pointer_latest_pos()).unwrap_or(origin);
+                        let here = cell_at(pos, origin, cell, size);
+                        if !down {
+                            // Not if the program turned mouse reporting off meanwhile (or exited): the shell would get it as typing.
+                            if app_mouse {
+                                out.extend(input::mouse_report(button | input::mouse_mods(mods), here.0, here.1, sgr, false));
+                            }
+                        } else if mode.intersects(TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION) && pane.mouse_cell != Some(here) {
+                            out.extend(input::mouse_report((button + 32) | input::mouse_mods(mods), here.0, here.1, sgr, true));
+                            pane.mouse_cell = Some(here);
+                        }
+                    }
+                    Some(Press::Select { anchor, side, started }) => {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let (pt, side) = at(pos);
+                            if resp.triple_clicked() {
+                                term.selection = Some(Selection::new(SelectionType::Lines, pt, side));
+                            } else if resp.double_clicked() {
+                                term.selection = Some(Selection::new(SelectionType::Semantic, pt, side));
+                            } else if resp.clicked() && !started {
+                                term.selection = None;
+                            }
+                        }
+                        if resp.drag_started() && !started {
+                            term.selection = Some(Selection::new(SelectionType::Simple, anchor, side));
+                            pane.press = Some(Press::Select { anchor, side, started: true });
+                        }
+                        if resp.dragged() {
+                            if let (Some(pos), Some(sel)) = (resp.interact_pointer_pos(), term.selection.as_mut()) {
+                                let (pt, side) = at(pos);
+                                sel.update(pt, side);
+                            }
+                        }
+                        let made = (!down && (started || resp.drag_stopped())) || resp.double_clicked() || resp.triple_clicked();
+                        if self.config.copy_on_select && made {
+                            copy_text = term.selection_to_string().filter(|s| !s.is_empty());
+                        }
+                    }
+                    None => {
+                        // Mode 1003 also wants moves with no button held.
+                        let hover = resp.hover_pos().filter(|p| mode.contains(TermMode::MOUSE_MOTION) && !mods.shift && body.contains(*p));
+                        match hover.map(|pos| cell_at(pos, origin, cell, size)) {
+                            Some(here) if pane.mouse_cell != Some(here) => {
+                                out.extend(input::mouse_report(35 | input::mouse_mods(mods), here.0, here.1, sgr, true));
+                                pane.mouse_cell = Some(here);
+                            }
+                            Some(_) => {}
+                            None => pane.mouse_cell = None,
+                        }
                     }
                 }
-                if resp.drag_started() {
-                    if let Some(o) = press_origin {
-                        let (pt, side) = at(o);
-                        term.selection = Some(Selection::new(SelectionType::Simple, pt, side));
-                    }
+                if !down {
+                    pane.press = None;
                 }
-                if resp.dragged() {
-                    if let (Some(pos), Some(sel)) = (resp.interact_pointer_pos(), term.selection.as_mut()) {
-                        let (pt, side) = at(pos);
-                        sel.update(pt, side);
-                    }
-                }
-                if self.config.copy_on_select && (resp.drag_stopped() || resp.double_clicked() || resp.triple_clicked()) {
-                    copy_text = term.selection_to_string().filter(|s| !s.is_empty());
-                }
+
                 if resp.contains_pointer() && scroll_y != 0.0 {
                     pane.scroll_accum += scroll_y / cell.y;
                     let lines = pane.scroll_accum.trunc() as i32;
                     pane.scroll_accum -= lines as f32;
                     if lines != 0 {
-                        let mode = *term.mode();
-                        let mods = ui.input(|i| i.modifiers);
                         let count = lines.unsigned_abs() as usize;
-                        // Mid-selection the wheel always scrolls our own scrollback: forwarding it
-                        // makes the app redraw, which wipes the selection being made.
-                        let selecting = resp.dragged() && term.selection.is_some();
-                        if selecting {
+                        let selecting = matches!(press, Some(Press::Select { .. })) && down;
+                        if selecting && !mode.contains(TermMode::ALT_SCREEN) {
+                            // The wheel with the button held selects through the scrollback, from where it went
+                            // down, even before the pointer has moved.
                             term.scroll_display(Scroll::Delta(lines));
+                            if let Some(Press::Select { anchor, side, started }) = &mut pane.press {
+                                if !*started {
+                                    term.selection = Some(Selection::new(SelectionType::Simple, *anchor, *side));
+                                    *started = true;
+                                }
+                            }
                             if let Some(pos) = resp.interact_pointer_pos() {
-                                let off = term.grid().display_offset();
-                                let (pt, side) = grid_point(pos, origin, cell, size, off);
+                                let (pt, side) = grid_point(pos, origin, cell, size, term.grid().display_offset());
                                 if let Some(sel) = term.selection.as_mut() {
                                     sel.update(pt, side);
                                 }
                             }
-                        } else if mode.intersects(TermMode::MOUSE_MODE) && !mods.shift {
-                            // App asked for mouse events (Claude Code, vim, htop...): send real
-                            // wheel events so it scrolls its own view. Shift+wheel bypasses this.
-                            let pos = resp.hover_pos().unwrap_or(origin);
-                            let col = (((pos.x - origin.x) / cell.x).max(0.0) as usize).min(size.cols - 1);
-                            let row = (((pos.y - origin.y) / cell.y).max(0.0) as usize).min(size.rows - 1);
-                            let mut button = if lines > 0 { 64 } else { 65 };
-                            button += 8 * mods.alt as u8 + 16 * mods.ctrl as u8;
-                            let seq = input::mouse_report(button, col, row, mode.contains(TermMode::SGR_MOUSE));
-                            drop(term);
-                            pane.write(seq.repeat(count));
+                        } else if selecting && term.selection.is_some() {
+                            // A full-screen program has no scrollback, and moving its view would slide other text
+                            // under the selection.
+                        } else if app_mouse && !mods.shift {
+                            // The program asked for mouse events: real wheel events, so it scrolls its own view
+                            // (and, mid-drag, its own selection). Shift+wheel bypasses this.
+                            let (col, row) = cell_at(resp.hover_pos().unwrap_or(origin), origin, cell, size);
+                            let button = (if lines > 0 { 64 } else { 65 }) | input::mouse_mods(mods);
+                            out.extend(input::mouse_report(button, col, row, sgr, true).repeat(count));
                         } else if mode.contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL) && !mods.shift {
                             // Full-screen apps without mouse support (less, man...) get arrow keys.
                             let app = mode.contains(TermMode::APP_CURSOR);
@@ -225,12 +299,43 @@ impl STerm {
                                 (false, true) => b"\x1bOB",
                                 (false, false) => b"\x1b[B",
                             };
-                            drop(term);
-                            pane.write(seq.repeat(count));
+                            out.extend(seq.repeat(count));
                         } else {
                             term.scroll_display(Scroll::Delta(lines));
                         }
                     }
+                }
+
+                // Dragging a selection above or below the text scrolls the scrollback, faster the further out.
+                let top = origin.y;
+                let bottom = origin.y + size.rows as f32 * cell.y;
+                let out_by = match (down, pane.press, resp.interact_pointer_pos()) {
+                    (true, Some(Press::Select { started: true, .. }), Some(p)) if !mode.contains(TermMode::ALT_SCREEN) => {
+                        if p.y < top { p.y - top } else if p.y > bottom { p.y - bottom } else { 0.0 }
+                    }
+                    _ => 0.0,
+                };
+                if out_by != 0.0 {
+                    let rate = (EDGE_SCROLL_MIN + EDGE_SCROLL_PER_CELL * out_by.abs() / cell.y).min(EDGE_SCROLL_MAX);
+                    pane.edge_scroll += rate * ui.input(|i| i.stable_dt).min(0.1);
+                    let lines = pane.edge_scroll.trunc() as i32;
+                    pane.edge_scroll -= lines as f32;
+                    if lines != 0 {
+                        term.scroll_display(Scroll::Delta(if out_by < 0.0 { lines } else { -lines }));
+                        let off = term.grid().display_offset();
+                        if let (Some(pos), Some(sel)) = (resp.interact_pointer_pos(), term.selection.as_mut()) {
+                            let (pt, side) = grid_point(pos, origin, cell, size, off);
+                            sel.update(pt, side);
+                        }
+                    }
+                    // Keep going while the pointer stays out there without moving.
+                    ctx.request_repaint();
+                } else {
+                    pane.edge_scroll = 0.0;
+                }
+                drop(term);
+                if !out.is_empty() {
+                    pane.write(out);
                 }
             }
 

@@ -351,8 +351,11 @@ Settings → Terminal → *Before the ❯* adds the folder (`~/s-term ❯`), or 
 | `Ctrl+Shift+Q` | Quit |
 
 **Mouse:** click a pane to focus it, drag to select, double-click to select a word and triple-click to select a line.
-Scroll for scrollback. Full-screen programs that ask for mouse input get it, so hold `Shift` to select text in them
-anyway. Drag a divider to resize panes, and middle-click a tab to close it.
+Scroll for scrollback; scroll with the button still held, or drag past the top or bottom of the text, to stretch the
+selection through it (the further out, the faster it scrolls). Programs that ask for
+mouse input (Claude Code's fullscreen view, vim with `mouse=a`, htop) get the clicks, drags and wheel and select text
+themselves, so hold `Shift` to use S-term's selection (and scrollback) in them anyway. Drag a divider to resize panes,
+and middle-click a tab to close it.
 
 ## Files and privacy
 
