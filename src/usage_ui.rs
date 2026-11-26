@@ -6,6 +6,7 @@ use std::f32::consts::{PI, TAU};
 use egui::{pos2, vec2, Align2, Color32, FontId, Id, Mesh, Painter, Pos2, Rect, RichText, Sense, Shape, Stroke};
 
 use crate::theme::{c32, lerp_color, Theme};
+use s_style::widgets::{chevron, section, text_toggle, thin_bar, working_dot};
 use crate::config::{Config, HeatMetric};
 use crate::usage::{civil, weekday, DayStat, Limit, Live, ModelTotal, PaneAgent, Snapshot, ToolStats, Window};
 
@@ -513,44 +514,6 @@ fn ring(p: &Painter, c: Pos2, r: f32, frac: f32, color: Color32, track: Color32,
 // ------------------------------------------------------------------------------------------ pieces
 
 /// A section heading: small muted caps on the left, optional controls on the right.
-fn section(ui: &mut egui::Ui, theme: &Theme, title: &str, right: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(18.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(title).size(10.5).strong().color(theme.muted.gamma_multiply(0.9)));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
-    });
-    ui.add_space(8.0);
-}
-
-/// A borderless toggle: muted text, full-strength when on, with an optional color dot.
-fn text_toggle(ui: &mut egui::Ui, theme: &Theme, label: &str, dot: Option<Color32>, on: bool, id: Id) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(label.to_string(), FontId::proportional(11.0), Color32::WHITE);
-    let dw = if dot.is_some() { 11.0 } else { 0.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(galley.size().x + dw + 12.0, 20.0), CLICK);
-    let t = ui.ctx().animate_bool_with_time(id, on, 0.15);
-    let h = ui.ctx().animate_bool_with_time(id.with("h"), resp.hovered(), 0.1);
-    let p = ui.painter();
-    if t > 0.0 || h > 0.0 {
-        p.rect_filled(r, 10.0, theme.header.gamma_multiply(t.max(h * 0.6)));
-    }
-    let mut x = r.min.x + 6.0;
-    if let Some(c) = dot {
-        p.circle_filled(pos2(x + 3.0, r.center().y), 3.0, c.gamma_multiply(0.45 + 0.55 * t.max(h)));
-        x += dw;
-    }
-    let col = lerp_color(theme.muted.gamma_multiply(0.85), theme.text, t.max(h * 0.5));
-    p.galley_with_override_text_color(pos2(x, r.center().y - galley.size().y / 2.0), galley, col);
-    resp
-}
-
-fn thin_bar(p: &Painter, r: Rect, frac: f32, color: Color32, theme: &Theme) {
-    p.rect_filled(r, r.height() / 2.0, theme.header);
-    let w = r.width() * frac.clamp(0.0, 1.0);
-    if w > 0.0 {
-        p.rect_filled(Rect::from_min_size(r.min, vec2(w.max(r.height()), r.height())), r.height() / 2.0, color);
-    }
-}
-
 fn pct_of(live: &Live) -> Option<f32> {
     live.context_pct.or_else(|| live.context_size.map(|s| live.context_tokens as f32 / s as f32 * 100.0))
 }
@@ -574,20 +537,6 @@ fn agent_label(a: &AgentPane, d: Option<&PaneAgent>) -> String {
         .or_else(|| d.and_then(|d| d.live.as_ref()).map(|l| l.label.clone()).filter(|l| !l.is_empty() && l != "conversation" && l != "session"))
         .or_else(|| d.and_then(|d| d.folder.clone()))
         .unwrap_or_else(|| format!("Tab {}", a.tab + 1))
-}
-
-/// A pulsing green dot (keeps repainting while shown).
-fn working_dot(ui: &egui::Ui, p: &Painter, c: Pos2, theme: &Theme) {
-    let t = ui.input(|i| i.time) as f32;
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(60));
-    p.circle_filled(c, 3.0, c32(theme.palette[2]).gamma_multiply(0.45 + 0.55 * (t * 3.0).sin().abs()));
-}
-
-/// A fold arrow: pointing right when `open` is 0, down at 1.
-fn chevron(p: &Painter, c: Pos2, open: f32, color: Color32) {
-    let (sin, cos) = (open * PI / 2.0).sin_cos();
-    let at = |x: f32, y: f32| c + vec2(x * cos - y * sin, x * sin + y * cos);
-    p.add(Shape::line(vec![at(-1.5, -3.5), at(2.0, 0.0), at(-1.5, 3.5)], Stroke::new(1.4_f32, color)));
 }
 
 /// A tool with agents in S-term's panes (of any window): its icon, its name and how many run,

@@ -9,7 +9,7 @@ use egui::{pos2, vec2, Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect,
 
 use crate::fonts::{MONO_BOLD, TOFU};
 use crate::pane::Listener;
-use crate::theme::{c32, lerp_rect, Theme};
+use crate::theme::{c32, lerp_rect, TermColors, Theme};
 
 /// Laid-out single glyphs, reused across frames (text layout is the expensive part).
 pub struct GlyphCache {

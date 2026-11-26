@@ -6,6 +6,7 @@
 # older distro (see .github/workflows/release.yml). A local build only runs on distros as new as yours.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+style="../s-style"   # the shared look, a path dependency (see Cargo.toml)
 
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)"
 name="s-term-$version-$(uname -m)-linux"
@@ -21,7 +22,7 @@ install -m755 scripts/install.sh "$out/install.sh"
 install -m644 scripts/s-term-prompt.sh "$out/scripts/"
 install -m644 assets/icon/s-term-*.png assets/icon/s-term.svg "$out/assets/icon/"
 install -m644 README.md "$out/"
-install -m644 assets/fonts/Inter-LICENSE.txt assets/fonts/JetBrainsMono-OFL.txt "$out/licenses/"
+install -m644 "$style/assets/fonts/Inter-LICENSE.txt" "$style/assets/fonts/JetBrainsMono-OFL.txt" "$out/licenses/"
 
 tar -C dist -czf "$out.tar.gz" "$name"
 (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")

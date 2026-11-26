@@ -1,19 +1,18 @@
 //! Window chrome: custom title bar (tabs + window controls), activity rail, status bar,
 //! and edge resizing for the frameless window.
 
-use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Margin, Mesh, Rect, ResizeDirection, Shape, Stroke, ViewportCommand};
+use egui::{pos2, vec2, Align2, Color32, CursorIcon, FontId, Id, Margin, Rect, ViewportCommand};
 
 use super::{STerm, CLICK, CLICK_DRAG};
 use crate::glass::{self, Lift};
 use crate::icons::{self, Icon};
 use crate::sidebar::Tab as View;
-use crate::theme::{c32, lerp_color, Theme};
+use crate::theme::{c32, lerp_color};
 use crate::usage_ui;
 
-pub const TITLE_H: f32 = 42.0;
-const RAIL_W: f32 = 50.0;
-const STATUS_H: f32 = 26.0;
-const WINDOW_ROUND: f32 = 12.0;
+pub use s_style::chrome::TITLE_H;
+use s_style::chrome::{elide_title, status_item, window_button, RAIL_W, STATUS_H};
+pub(super) use s_style::chrome::resize_cursor;
 
 enum Act {
     StartDrag,
@@ -29,47 +28,7 @@ enum Act {
     View(View),
 }
 
-/// The scorpion "S" glyph, tinted with an accent → accent2 gradient.
-pub(super) fn paint_logo(p: &egui::Painter, tex: egui::TextureId, r: Rect, theme: &Theme) {
-    let mut mesh = Mesh::with_texture(tex);
-    let (a, b) = (theme.accent, theme.accent2);
-    let mid = lerp_color(a, b, 0.5);
-    let corners = [(r.left_top(), pos2(0.0, 0.0), a), (r.right_top(), pos2(1.0, 0.0), mid), (r.right_bottom(), pos2(1.0, 1.0), b), (r.left_bottom(), pos2(0.0, 1.0), mid)];
-    for (pt, uv, c) in corners {
-        mesh.vertices.push(egui::epaint::Vertex { pos: pt, uv, color: c });
-    }
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(0, 2, 3);
-    p.add(Shape::mesh(mesh));
-}
-
-/// The scorpion in one flat color.
-pub(super) fn paint_glyph(p: &egui::Painter, tex: egui::TextureId, r: Rect, color: Color32) {
-    let mut mesh = Mesh::with_texture(tex);
-    mesh.add_rect_with_uv(r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), color);
-    p.add(Shape::mesh(mesh));
-}
-
-/// The "Ask S-term" badge: the glossy orb with the scorpion on it.
-pub(super) fn ask_badge(p: &egui::Painter, tex: egui::TextureId, c: egui::Pos2, r: f32, theme: &Theme) {
-    glass::orb(p, c, r, theme);
-    let g = Rect::from_center_size(c, vec2(r * 1.75, r * 1.75));
-    paint_glyph(p, tex, g.translate(vec2(0.0, 0.8)), Color32::from_black_alpha(90));
-    paint_glyph(p, tex, g, Color32::WHITE);
-}
-
-fn window_button(ui: &mut egui::Ui, rect: Rect, icon: Icon, theme: &Theme, danger: bool, id: &str) -> bool {
-    let resp = ui.interact(rect, Id::new(id), CLICK);
-    let t = ui.ctx().animate_bool_with_time(Id::new((id, "h")), resp.hovered(), 0.1);
-    let fill = if danger { Color32::from_rgb(0xe5, 0x5a, 0x45) } else { theme.header_focused };
-    if t > 0.0 {
-        let c = Rect::from_center_size(rect.center(), vec2(30.0, 30.0));
-        ui.painter().rect_filled(c, 15.0, fill.gamma_multiply(t));
-    }
-    let col = if danger { lerp_color(theme.muted, Color32::WHITE, t) } else { lerp_color(theme.muted, theme.text, t) };
-    icons::draw(ui.painter(), icon, icons::center_rect(rect.center(), 14.0), col);
-    resp.clicked()
-}
+pub(super) use s_style::brand::{badge as ask_badge, paint_glyph, paint_logo};
 
 /// Tab label: the shell title without its `user@host:` prefix (`scorpius@fedora:~/s-term` → `~/s-term`).
 pub(super) fn tab_title(title: &str) -> &str {
@@ -99,29 +58,6 @@ mod tests {
         assert_eq!(tab_title("⠂ Running the project"), "Running the project");
         assert_eq!(tab_title("ssh me@box: uptime"), "ssh me@box: uptime");
     }
-}
-
-/// A clickable status-bar item: optional icon + text.
-fn status_item(ui: &mut egui::Ui, theme: &Theme, icon: Option<Icon>, text: &str, color: Color32, id: Id) -> egui::Response {
-    let font = FontId::proportional(11.5);
-    let galley = ui.painter().layout_no_wrap(text.to_string(), font, color);
-    let iw = if icon.is_some() { 16.0 } else { 0.0 };
-    let (r, resp) = ui.allocate_exact_size(vec2(galley.size().x + iw + 12.0, STATUS_H - 6.0), CLICK);
-    let t = ui.ctx().animate_bool_with_time(id, resp.hovered(), 0.1);
-    let tinted = color != theme.muted;
-    if tinted {
-        // A tinted badge, like a delta or status chip.
-        ui.painter().rect_filled(r, r.height() / 2.0, color.gamma_multiply(0.10 + 0.08 * t));
-    } else if t > 0.0 {
-        ui.painter().rect_filled(r, r.height() / 2.0, theme.header.gamma_multiply(t));
-    }
-    let mut x = r.min.x + 6.0;
-    if let Some(i) = icon {
-        icons::draw(ui.painter(), i, icons::center_rect(pos2(x + 6.0, r.center().y), 12.0), color);
-        x += iw;
-    }
-    ui.painter().galley(pos2(x, r.center().y - galley.size().y / 2.0), galley, color);
-    resp
 }
 
 impl STerm {
@@ -552,86 +488,17 @@ impl STerm {
 
     /// Resize the frameless window from its edges.
     pub(super) fn frame_resize(&mut self, ctx: &egui::Context) {
-        self.frame_resizing = false;
-        if self.config.system_titlebar || ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false)) {
-            return;
-        }
-        let screen = ctx.screen_rect();
-        let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else { return };
-        let m = 6.0;
-        let (l, r, t, b) = (pos.x < screen.min.x + m, pos.x > screen.max.x - m, pos.y < screen.min.y + m, pos.y > screen.max.y - m);
-        let dir = match (l, r, t, b) {
-            (true, _, true, _) => ResizeDirection::NorthWest,
-            (_, true, true, _) => ResizeDirection::NorthEast,
-            (true, _, _, true) => ResizeDirection::SouthWest,
-            (_, true, _, true) => ResizeDirection::SouthEast,
-            (true, ..) => ResizeDirection::West,
-            (_, true, ..) => ResizeDirection::East,
-            (_, _, true, _) => ResizeDirection::North,
-            (_, _, _, true) => ResizeDirection::South,
-            _ => return,
-        };
-        ctx.set_cursor_icon(resize_cursor(dir));
-        if ctx.input(|i| i.pointer.primary_pressed()) {
-            ctx.send_viewport_cmd(ViewportCommand::BeginResize(dir));
-            self.frame_resizing = true;
-        }
+        self.frame_resizing = s_style::chrome::frame_resize(ctx, !self.config.system_titlebar);
     }
 
     /// Corner radius of the frameless window: rounded when floating, square when maximized or fullscreen.
     pub(super) fn window_rounding(&self, ctx: &egui::Context) -> f32 {
-        let filled = ctx.input(|i| i.viewport().maximized.unwrap_or(false) || i.viewport().fullscreen.unwrap_or(false));
-        if self.config.system_titlebar || filled {
-            0.0
-        } else {
-            WINDOW_ROUND
-        }
+        s_style::chrome::window_rounding(ctx, self.config.system_titlebar)
     }
 
     /// The window's own edge: a hairline rim with soft light along the top, like the other glass.
     pub(super) fn window_border(&self, ctx: &egui::Context) {
-        let rounding = self.window_rounding(ctx);
-        if rounding == 0.0 {
-            return;
-        }
-        let p = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, Id::new("s-term-border")));
-        let r = ctx.screen_rect();
-        p.rect_stroke(r.shrink(0.5), rounding, Stroke::new(1.0_f32, lerp_color(self.theme.border, self.theme.rim, 0.5)));
-        glass::paint_rim(&p, r, rounding, &self.theme, 1.2);
+        s_style::chrome::window_border(ctx, &self.theme, self.window_rounding(ctx));
     }
 }
 
-/// Fit a tab title in `max_w` pixels with a "…". A path (`~/…`, `/…`) loses its start, so the folder
-/// you're in stays visible; anything else (Claude Code, Codex and Antigravity title the tab with what
-/// the session is about) loses its end, since it reads from the start.
-fn elide_title(p: &egui::Painter, text: &str, font: &FontId, max_w: f32) -> String {
-    let width = |t: &str| p.layout_no_wrap(t.to_string(), font.clone(), Color32::WHITE).size().x;
-    if text.is_empty() || width(text) <= max_w {
-        return text.to_string();
-    }
-    let path = text.starts_with('~') || text.starts_with('/');
-    let starts: Vec<usize> = text.char_indices().map(|(i, _)| i).chain([text.len()]).collect();
-    let n = starts.len() - 1;
-    // The title with only `k` of its chars kept; binary search for the largest k that fits.
-    let cut = |k: usize| if path { format!("…{}", &text[starts[n - k]..]) } else { format!("{}…", text[..starts[k]].trim_end()) };
-    let (mut lo, mut hi) = (0, n - 1);
-    while lo < hi {
-        let mid = (lo + hi + 1) / 2;
-        if width(&cut(mid)) <= max_w {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    cut(lo)
-}
-
-/// The pointer shape for resizing from an edge or corner.
-pub(super) fn resize_cursor(dir: ResizeDirection) -> CursorIcon {
-    match dir {
-        ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::ResizeNwSe,
-        ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::ResizeNeSw,
-        ResizeDirection::East | ResizeDirection::West => CursorIcon::ResizeHorizontal,
-        _ => CursorIcon::ResizeVertical,
-    }
-}

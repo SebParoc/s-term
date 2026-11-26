@@ -1,5 +1,5 @@
 //! Fonts. S-term ships JetBrains Mono (terminal) and Inter (interface), both under the SIL Open
-//! Font License (see `assets/fonts/`). Any installed monospace font can be picked in Settings,
+//! Font License (see `../s-style/assets/fonts/`). Any installed monospace font can be picked in Settings,
 //! or forced with `S_TERM_FONT="Family Name"`.
 
 use std::collections::HashSet;
@@ -14,9 +14,8 @@ pub const TOFU: char = '\u{25FB}';
 /// The bundled terminal font (the default).
 pub const BUNDLED_MONO: &str = "JetBrains Mono";
 
-const JB_REGULAR: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf");
-const JB_BOLD: &[u8] = include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf");
-const INTER: &[u8] = include_bytes!("../assets/fonts/Inter-Medium.ttf");
+// Bundled in the shared style crate (../s-style/assets/fonts), which S-study uses too.
+use s_style::fonts::{INTER, JB_BOLD, JB_REGULAR};
 
 /// (family, file, face index) of the best fontconfig match.
 fn fc_match(pattern: &str) -> Option<(String, String, u32)> {

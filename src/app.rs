@@ -37,12 +37,10 @@ use crate::layout::{Node, Orientation};
 use crate::pane::{GridSize, Pane, PaneId};
 use crate::render::GlyphCache;
 use crate::sidebar::{Sidebar, UiAction};
-use crate::theme::Theme;
+use crate::theme::{TermColors, Theme};
 
 /// Clickable but never keyboard-focusable, so Tab/Space/Enter always go to the shell.
-pub(crate) const CLICK: egui::Sense = egui::Sense { click: true, drag: false, focusable: false };
-pub(crate) const CLICK_DRAG: egui::Sense = egui::Sense { click: true, drag: true, focusable: false };
-pub(crate) const DRAG: egui::Sense = egui::Sense { click: false, drag: true, focusable: false };
+pub(crate) use s_style::chrome::{CLICK, CLICK_DRAG, DRAG};
 
 struct Tab {
     root: Node,
@@ -171,7 +169,7 @@ impl STerm {
             devshot: devshot::DevShot::from_env(),
             logo: ctx.load_texture(
                 "s-term-logo",
-                egui::ColorImage::from_rgba_unmultiplied([256, 256], include_bytes!("../assets/icon/glyph-256.rgba")),
+                egui::ColorImage::from_rgba_unmultiplied([256, 256], s_style::brand::GLYPH_256),
                 egui::TextureOptions::LINEAR,
             ),
             zoom_accum: 1.0,
@@ -714,8 +712,8 @@ impl STerm {
                 TermEvent::PtyWrite(s) => pane.write(s.into_bytes()),
                 TermEvent::ClipboardStore(_, s) => ctx.output_mut(|o| o.copied_text = s),
                 TermEvent::ColorRequest(i, fmt) => {
-                    let rgb = self.theme.index(i, pane.term.lock().colors());
-                    pane.write(fmt(rgb).into_bytes());
+                    let c = self.theme.index(i, pane.term.lock().colors());
+                    pane.write(fmt(alacritty_terminal::vte::ansi::Rgb { r: c.r, g: c.g, b: c.b }).into_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(fmt) => {
                     let s = fmt(pane.window_size());

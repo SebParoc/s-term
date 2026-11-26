@@ -14,14 +14,13 @@ use crate::input;
 use crate::layout::{Divider, Orientation};
 use crate::pane::{GridSize, Press};
 use crate::render;
-use crate::theme::{c32, lerp_color, lerp_rect};
+use crate::theme::{lerp_color, lerp_rect};
 
 const HEADER_H: f32 = 40.0;
-const GAP: f32 = 6.0;
+use crate::glass::PANE_GAP as GAP;
 const PAD: f32 = 6.0;
-const ROUND: f32 = 14.0;
+use crate::glass::PANE_ROUND as ROUND;
 /// Pane outline width in points: under 1px, so it renders as a fainter hairline.
-const PANE_BORDER: f32 = 0.6;
 /// Exponential smoothing rates (1/s): higher = snappier.
 const LAYOUT_SPEED: f32 = 16.0;
 const CURSOR_SPEED: f32 = 38.0;
@@ -345,10 +344,8 @@ impl STerm {
                 let glow = egui::epaint::Shadow { offset: vec2(0.0, 0.0), blur: 22.0, spread: 0.0, color: theme.accent.gamma_multiply(0.16 * t) };
                 painter.add(glow.as_shape(r, ROUND));
             }
-            painter.add(egui::epaint::Shadow { offset: vec2(0.0, 6.0), blur: 22.0, spread: 0.0, color: Color32::from_black_alpha(80) }.as_shape(r, ROUND));
-            painter.rect_filled(r, ROUND, c32(theme.bg));
-            // Glass, like the other panels: a soft sheen (under the text) and edge lighting.
-            crate::glass::sheen(&painter, r, ROUND, theme, 0.6 + 0.25 * t);
+            // Glass, like the other panels: shadow, a soft sheen (under the text) and edge lighting.
+            crate::glass::pane_back(&painter, r, theme, t);
 
             if header_h > 0.0 {
                 let top = Rounding { nw: ROUND, ne: ROUND, sw: 0.0, se: 0.0 };
@@ -403,12 +400,8 @@ impl STerm {
                     let bottom = if header_h > 0.0 { Rounding { nw: 0.0, ne: 0.0, sw: ROUND, se: ROUND } } else { Rounding::same(ROUND) };
                     painter.rect_filled(body, bottom, Color32::from_black_alpha(((1.0 - t) * 70.0) as u8));
                 }
-                let border = lerp_color(theme.rim, theme.accent.gamma_multiply(0.85), t);
-                painter.rect_stroke(r.shrink(0.3), ROUND, Stroke::new(PANE_BORDER, border));
-            } else {
-                painter.rect_stroke(r.shrink(0.3), ROUND, Stroke::new(PANE_BORDER, theme.rim));
             }
-            crate::glass::paint_rim(&painter, r, ROUND, theme, 0.45 + 0.35 * t);
+            crate::glass::pane_edge(&painter, r, theme, t, if multi { t } else { 0.0 });
 
             // ---- scrollbar: a thin floating handle over the right padding, like the side panel's.
             {

@@ -10,6 +10,9 @@ name = "s-term"
 path = "src/main.rs"
 
 [dependencies]
+# The look (themes, glass, icons, fonts, the scorpion mark, window chrome) is its own repo, shared
+# with S-study: clone https://github.com/SebParoc/s-style next to this one.
+s-style = { path = "../s-style" }
 # Terminal emulation core (VT parser, grid, scrollback, PTY + IO event loop)
 alacritty_terminal = "0.24"
 # Window + GPU rendering + input

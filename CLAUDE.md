@@ -170,11 +170,16 @@ memory and never touches these files.
 
 - `render.rs` paints the grid cell by cell with a `GlyphCache` of laid-out single glyphs. `ensure_metrics` snaps cell
   sizes to whole physical pixels.
-- `theme.rs`: a `Theme` holds both the 16-color terminal palette and the UI chrome colors. A new preset needs an
-  entry in `theme::PRESETS` (id and display name) and a match arm in `Theme::preset`. `glass.rs` draws the frosted surfaces and the backdrop.
+- The look is the `s-style` crate, its own repo next to this one (`../s-style`, a path dependency; see its
+  CLAUDE.md), which S-study uses too, so a change there shows in both apps: `theme.rs` (a `Theme` holds the 16-color terminal palette and the UI chrome colors derived
+  from it; a new preset needs an entry in `PRESETS` and a match arm in `Theme::preset`), `glass.rs` (frosted surfaces,
+  backdrop, pick pill, orb), `icons.rs`, `fonts.rs` (the bundled font bytes) and `brand.rs` (the scorpion glyph and
+  badge). `src/theme.rs`, `src/glass.rs` and `src/icons.rs` re-export it; `src/theme.rs` adds `TermColors`, the
+  256-color and OSC lookups only a terminal needs. Keep `s-style` free of terminal types (it has its own `Rgb`).
 - The window is frameless and transparent by default. `chrome.rs` draws the rounded corners, the title bar and the
   edge-resize handling. `config.system_titlebar` switches to native decorations.
 - The Ask popup can open in its own OS viewport (`show_viewport_immediate`, id `s-term-ask`), so the terminal stays
   usable while it is open.
-- Fonts (JetBrains Mono, Inter) are embedded with `include_bytes!`. `assets/icon/app-64.rgba` and `glyph-256.rgba`
-  are raw RGBA8 (64×64 and 256×256), also embedded at compile time. If you change the icon, regenerate them.
+- Fonts (JetBrains Mono, Inter) are embedded with `include_bytes!` in `s-style`. `assets/icon/app-64.rgba` and
+  `../s-style/assets/glyph-256.rgba` are raw RGBA8 (64×64 and 256×256), also embedded at compile time. If you
+  change the icon, regenerate them.

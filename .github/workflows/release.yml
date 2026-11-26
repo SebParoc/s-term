@@ -25,16 +25,24 @@ jobs:
         run: |
           curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # S-term and its shared look (a path dependency at ../s-style) side by side.
       - uses: actions/checkout@v4
+        with:
+          path: s-term
+      - uses: actions/checkout@v4
+        with:
+          repository: SebParoc/s-style
+          path: s-style
       - name: Build the tarball
+        working-directory: s-term
         run: ./scripts/package.sh
       - uses: actions/upload-artifact@v4
         with:
           name: s-term-linux
-          path: dist/*.tar.gz*
+          path: s-term/dist/*.tar.gz*
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.gz*
+          files: s-term/dist/*.tar.gz*
           generate_release_notes: true

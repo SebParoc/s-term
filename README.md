@@ -68,6 +68,7 @@ the bundled SQLite (`sudo dnf install gcc` or `sudo apt install build-essential`
 
 ```sh
 git clone https://github.com/SebParoc/s-term.git
+git clone https://github.com/SebParoc/s-style.git   # the shared look, built in from ../s-style
 cd s-term
 ./scripts/install.sh
 ```
@@ -75,7 +76,7 @@ cd s-term
 The script builds the release binary, links `~/.local/bin/s-term` to it, and adds the icon, the app menu entry and
 the prompt script. The app runs straight from `target/release` in your clone, so keep the folder where it is. Every
 `cargo build --release` updates the installed app (reopen S-term to see the changes), and
-`git pull && ./scripts/install.sh` updates everything. To try S-term without installing it, run
+`git pull` (in both clones) `&& ./scripts/install.sh` updates everything. To try S-term without installing it, run
 `cargo run --release`.
 
 ### After installing
@@ -446,10 +447,9 @@ glibc as new as yours.
 | `src/pricing.rs` | API list prices per model, for the AI view's USD cost |
 | `src/usage_ui.rs` | AI view, its icons and the status-bar meter |
 | `src/config.rs` | Settings file |
-| `src/theme.rs` | Color themes |
+| `../s-style` | Its own repo, shared with S-study: color themes, glass surfaces, line icons, bundled fonts, the scorpion mark, window chrome |
+| `src/theme.rs` | Terminal color lookups on the shared themes (256 colors, OSC overrides) |
 | `src/fonts.rs` | Bundled fonts, the installed-font picker, and system fonts loaded on demand for missing characters |
-| `src/glass.rs` | Glass surfaces, the backdrop, the selection pill and the search orb |
-| `src/icons.rs` | Vector line icons |
 | `scripts/install.sh` | Installs from a clone (builds it) or from a release tarball, and `--uninstall` |
 | `scripts/package.sh` | Builds the release tarball |
 | `scripts/s-term-prompt.sh` | The bash prompt for S-term |
@@ -465,7 +465,7 @@ glibc as new as yours.
 ## Credits
 
 S-term ships **JetBrains Mono** for the terminal and **Inter** for the interface, both under the SIL Open Font
-License. Their licenses are in `assets/fonts/`. You can pick any installed monospace font in Settings. A character
+License. They're bundled by [s-style](https://github.com/SebParoc/s-style), with their licenses in its `assets/fonts/`. You can pick any installed monospace font in Settings. A character
 that none of these has (symbols, CJK, Nerd Font icons) is drawn with an installed font that does, found through
 fontconfig. The scorpion
 "S" app icon is in `assets/icon/`.
